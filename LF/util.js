@@ -101,6 +101,20 @@ define(function () {
     This is considered insecure in F.LF. thus F.LF only allows simple predefined condition checking.
     */
   util.setup_resourcemap = function (pack) {
+    // RL: 本地开发（127.0.0.1 / localhost）不启用素材包自带的外网映射。
+    // LF2_19/resourcemap.js 的条件是 "location contain http at 0"，本地地址同样满足，
+    // 于是每局重开都会去拉 Google 上的图。本地只返回兜底映射（直接读素材包里的文件），
+    // 断网也能跑，开局也不用先等外网超时。
+    const local_dev = window.location.hostname === '127.0.0.1' ||
+      window.location.hostname === 'localhost' ||
+      window.location.hostname === '[::1]'
+    if (local_dev) {
+      return [{
+        get: function (res) {
+          return pack.location + res
+        }
+      }]
+    }
     if (pack.resourcemap) {
       if (typeof pack.resourcemap.condition === 'string') {
         const cond = pack.resourcemap.condition.split(' ')

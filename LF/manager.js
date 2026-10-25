@@ -247,6 +247,10 @@ define(['LF/global', 'LF/network', 'LF/soundpack', 'LF/match', 'LF/util', 'LF/to
         } else if (param.demo_display) {
           this.start_demo(false)
           util.div('maximize_button').onclick()
+        } else if (param.pve) {
+          // 真人对模型：Dennis 也设成 human，人用第二套键位（U/M/H/K/I/,/J）操作它，
+          // Davis 留给训练好的模型（RL 桥接只往 0 号角色注入，见 match.js 的 rl_controller）
+          this.start_debug('human')
         } else if (param.debug) {
           this.start_debug()
         } else {
@@ -1512,7 +1516,10 @@ define(['LF/global', 'LF/network', 'LF/soundpack', 'LF/match', 'LF/util', 'LF/to
         })
       }
 
-      this.start_debug = function () {
+      // p2_type 只影响 Dennis 的 type：
+      //   start_debug()        → 'computer'，训练和评估走这条（行为必须保持不变）
+      //   start_debug('human') → 人是 Dennis、模型是 Davis，用于 ?pve 真人对打
+      this.start_debug = function (p2_type) {
         const match = this.start_match({
           players: [
             {
@@ -1526,7 +1533,7 @@ define(['LF/global', 'LF/network', 'LF/soundpack', 'LF/match', 'LF/util', 'LF/to
             {
               use: true,
               name: 'Dennis',
-              type: 'computer',
+              type: p2_type || 'computer',
               selected: 8,
               selected_AI: 0,
               team: 2

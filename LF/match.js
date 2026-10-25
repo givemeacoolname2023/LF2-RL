@@ -2,6 +2,9 @@
 var rl_ws = null;
 var rl_action = 0;
 var rl_controller = null; // 将在 match 创建后设置
+// 每次页面载入生成一个新的 session id。env.py 用它判断“页面真的重开过”，
+// 不再依赖 time 很小（页面从载入跑到 time=10 只要 0.2 秒，重连根本来不及）
+var rl_session_id = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
 var rl_last_damage_t = 0;  // 上次造成伤害的时间
 var rl_last_dennis_hp = 500;  // 上次 dennis 的 hp
 var rl_reloading = false;  // 防止重复 reload
@@ -24,7 +27,15 @@ var ACTION_MAP = [
 ];
 
 function rl_inject_action(action) {
-  if (!rl_controller) return;
+  // 触屏控制器没有 buf，直接跳过，避免每帧抛异常把整个游戏循环卡死
+  if (!rl_controller || !rl_controller.buf) return;
+  // 只有训练端（env.py）连着时才注入。注入的「全键抬起」会清掉玩家按住的方向键
+  // （角色的移动/连招读的是 con.state 电平，见 LF/character.js 与 core/combodec.js），
+  // 没有训练连接时完全不干预，手动玩的手感与官方页面一致。
+  if (!rl_ws || rl_ws.readyState !== 1) return;
+  // 比赛已结束：不再注入。注入的 att/jump 会经 controller.child 传到 match.key，
+  // 在 gameover 状态下触发 F4() 退回主菜单，导致训练端再也收不到状态。
+  if (typeof rl_match !== 'undefined' && rl_match && rl_match.gameover_state) return;
   var keys = ACTION_MAP[action] || [];
   var all_keys = ['left', 'right', 'up', 'down', 'jump', 'att', 'def'];
 
@@ -45,7 +56,13 @@ function rl_inject_action(action) {
     rl_ws = new WebSocket('ws://localhost:8765');
     rl_ws.onopen = function () { console.log('RL bridge connected'); };
     rl_ws.onmessage = function (e) {
-      var msg = JSON.parse(e.data);
+      var msg;
+      try { msg = JSON.parse(e.data); } catch (err) { return; }
+      // 后端要求重开一局（回合结束/超时/页面停在主菜单时由 env.py 主动请求）
+      if (msg.cmd === 'reload') {
+        window.location.reload();
+        return;
+      }
       rl_action = msg.action || 0;
       rl_inject_action(rl_action);
     };
@@ -56,6 +73,15 @@ function rl_inject_action(action) {
   }
   connect();
 })();
+
+// 保活：持有 Web Lock 的页面不会被浏览器的 Page Lifecycle 冻结。
+// 这只能防止“冻结”，后台标签页的定时器降频仍需浏览器参数配合
+// （见 lf2-rl/launch_browser.py 的 --disable-background-timer-throttling）。
+if (navigator.locks && navigator.locks.request) {
+  navigator.locks.request('lf2_rl_keepalive', function () {
+    return new Promise(function () { /* 永不 resolve，锁一直持有 */ });
+  });
+}
 
 
 
@@ -95,6 +121,7 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
 
     match.prototype.create = function (setting) {
       const $ = this
+      window.rl_match = $   // RL: 供 rl_inject_action 判断比赛是否已结束
       let object_ids = []
       const AI_ids = []
       for (var i = 0; i < setting.player.length; i++) {
@@ -283,7 +310,8 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
     match.prototype.frame = function () {
       const $ = this
       // 每帧在 fetch 之前注入动作，保证攻击键被正确检测
-      if (rl_controller) {
+      // 只在训练端连着时注入（否则连调试日志也会刷屏，且会干扰手动操作）
+      if (rl_controller && rl_ws && rl_ws.readyState === 1) {
         rl_inject_action(rl_action)
         // 每30帧打印一次调试信息
         if ($.time.t % 30 === 0) {
@@ -297,7 +325,7 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
               ' | dx=' + Math.round(dbg_state.davis.x - dbg_state.dennis.x) +
               ' | att_key=' + (rl_controller.buf.length > 0 ? '1' : '0')
             )
-            // 超时检测已关闭，依靠 env.py 的 MAX_STEPS 控制每局长度
+            // 超时检测已关闭，依靠 env.py 的 MAX_EPISODE_STEPS 控制每局长度
             // 帧率检测已关闭
           }
         }
@@ -401,6 +429,7 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
       if (!davis || !dennis) return null
 
       return {
+        session: rl_session_id,
         time: $.time.t,
         davis: {
           x: davis.ps.x, y: davis.ps.y,

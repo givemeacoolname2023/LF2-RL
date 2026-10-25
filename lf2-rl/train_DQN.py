@@ -12,13 +12,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from collections import deque
-from rl_env import LF2Env
+from env import LF2Env
 
 # =====================================================
 # 超參數
 # =====================================================
 EPISODES        = 5000    # 總訓練場數
-OBS_DIM         = 12      # 觀察值維度
+OBS_DIM         = 13      # 觀察值維度（必須與 env.py 的 observation_space 一致）
 ACT_DIM         = 11      # 動作數量
 
 GAMMA           = 0.99    # 折扣因子
@@ -140,16 +140,17 @@ def evaluate(q_net, env, device, n_episodes=EVAL_EPISODES):
     q_net.eval()
     with torch.no_grad():
         for _ in range(n_episodes):
-            obs = env.reset()
+            obs, _ = env.reset()
             ep_reward = 0
             done = False
             while not done:
                 obs_t = torch.FloatTensor(obs).unsqueeze(0).to(device)
                 action = q_net(obs_t).argmax().item()
-                obs, reward, done, info = env.step(action)
+                obs, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
                 ep_reward += reward
             total_reward += ep_reward
-            if info == 'win':
+            if info.get('result') == 'win':
                 wins += 1
     q_net.train()
 
@@ -188,7 +189,7 @@ def train():
     print('=' * 60)
 
     for episode in range(1, EPISODES + 1):
-        obs  = env.reset()
+        obs, _ = env.reset()
         done = False
         ep_reward   = 0.0
         ep_steps    = 0
@@ -199,7 +200,8 @@ def train():
             epsilon = get_epsilon(total_steps)
             action  = select_action(q_net, obs, epsilon, device)
 
-            next_obs, reward, done, info = env.step(action)
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
 
             buffer.push(obs, action, reward, next_obs, float(done))
             obs = next_obs
@@ -219,7 +221,8 @@ def train():
                 target_net.load_state_dict(q_net.state_dict())
 
         # 每場結束：印簡單訊息
-        result_str = {'win': '🏆 贏', 'lose': '💀 輸', 'timeout': '⏱ 超時'}.get(info, info)
+        result_str = {'win': '🏆 贏', 'lose': '💀 輸', 'timeout': '⏱ 超時',
+                      'max_steps': '⏱ 超時'}.get(info.get('result'), '❓ 中斷')
         avg_loss   = ep_loss_sum / ep_loss_cnt if ep_loss_cnt > 0 else 0
         epsilon    = get_epsilon(total_steps)
 

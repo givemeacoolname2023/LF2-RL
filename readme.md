@@ -19,22 +19,30 @@ The agent went through two training phases, achieving a **50–64% rolling win r
 
 ## Repository Structure
 
+The engine loads its sprites and data from a **sibling** directory `LF2_19` (configured in
+`game/game.html` as `"package": "../LF2_19"`), so the layout has to look like this:
+
 ```
-lf2-rl/
-├── lf2_rl/
-│   ├── env.py           # Gymnasium environment — WebSocket bridge, reward, obs
-│   ├── bridge.py        # Low-level WebSocket server (JS ↔ Python communication)
-│   ├── train.py         # Phase 2: PPO training loop (Stable-Baselines3)
-│   ├── train_DQN.py     # Phase 3: Double DQN training loop
-│   ├── test_bridge.py   # Bridge connection test utility
-│   └── logs/            # Training logs and win-rate plots
-├── LF/                  # F.LF game engine (inherited, with RL modifications)
-│   ├── match.js         # Match logic (modified to push state via WebSocket)
-│   └── controller.js    # Key injection controller
-└── index.html           # Game entry point
+group_project/
+├── LF2-RL/                  # this repository
+│   ├── lf2-rl/              # all RL code
+│   │   ├── env.py           # Gymnasium environment — WebSocket bridge, reward, obs
+│   │   ├── bridge.py        # Low-level WebSocket server (JS ↔ Python communication)
+│   │   ├── train.py         # Phase 2: PPO training loop (Stable-Baselines3)
+│   │   ├── train_DQN.py     # Phase 3: Double DQN training loop
+│   │   ├── test_bridge.py   # Bridge connection test utility
+│   │   ├── serve.py         # Static server that sends Cache-Control: no-store
+│   │   ├── launch_browser.py# Headless Chrome launcher (background-throttling disabled)
+│   │   └── logs/            # Training logs (TensorBoard event files)
+│   ├── LF/                  # F.LF game engine (inherited, with RL modifications)
+│   │   ├── match.js         # Match logic (modified to push state via WebSocket)
+│   │   └── controller.js    # Key injection controller
+│   ├── game/game.html       # actual game page (training entry point, see step 4)
+│   └── index.html           # upstream F.LF landing page — not used for training
+└── LF2_19/                  # game assets, NEXT TO LF2-RL (not inside it)
 ```
 
-All training code lives in `lf2_rl/`. Use `train.py` for Phase 2 (PPO) and `train_DQN.py` for Phase 3 (Double DQN).
+All training code lives in `lf2-rl/`. Use `train.py` for Phase 2 (PPO) and `train_DQN.py` for Phase 3 (Double DQN).
 
 ---
 
@@ -62,20 +70,57 @@ Each game frame, the JS side pushes a JSON state object (HP, MP, position, facin
 pip install torch numpy gymnasium websockets stable-baselines3
 ```
 
-**2. Serve the game**
+Verified with Python 3.10 / torch 2.5.1 / stable-baselines3 2.5.0 (conda env `lf2rl`).
+If `import stable_baselines3` fails with `ImportError: C extension: None not built`, the
+active interpreter has a broken pandas — switch interpreters, it is not a project bug.
+
+**2. Get the game assets**
+
+`LF2_19` must be a sibling of `LF2-RL`, not a subdirectory:
+
 ```bash
-cd /path/to/repo
-python -m http.server 8000
+cd /path/to/group_project        # the directory that contains LF2-RL/
+git clone https://github.com/Project-F/LF2_19.git LF2_19
 ```
 
-**3. Open the game in browser**
-```
-http://localhost:8000/index.html
+**3. Serve the game**
+```bash
+cd LF2-RL/lf2-rl
+python serve.py --port 8000      # --port 8010 if 8000 is already taken
 ```
 
-**4. Run training**
+`serve.py` is a drop-in replacement for `python -m http.server` that also answers with
+`Cache-Control: no-store`. Without it Chrome may keep running an old `match.js` after
+you edit it (heuristic caching), which looks like "my change did nothing".
+
+**4. Open the game**
 ```bash
-cd lf2_rl
+python launch_browser.py --port 8000
+```
+
+This launches a dedicated headless Chrome with background throttling disabled, so
+training keeps going when the window is minimized or you switch to another app.
+To open it manually instead, use the same URL:
+
+```
+http://localhost:8000/LF2-RL/game/game.html?debug&headless
+```
+
+`?debug` starts Davis vs Dennis automatically, `?headless` skips canvas rendering.
+To actually watch the fight, drop `?headless` and pass `--visible` to `launch_browser.py`.
+
+Query parameter cheatsheet:
+
+| URL | What you get |
+|---|---|
+| `game/game.html` | normal F.LF main menu — pick characters, stage and difficulty yourself |
+| `game/game.html?debug` | skips the menu, jumps straight into Davis vs Dennis (the training matchup) |
+| `game/game.html?demo` | built-in AI vs AI demo, `Esc` to leave |
+| `game/game.html?debug&headless` | training / unattended (no rendering) |
+
+**5. Run training**
+```bash
+cd lf2-rl
 
 # Phase 2: PPO
 python train.py
@@ -85,6 +130,15 @@ python train_DQN.py
 ```
 
 The script waits for the browser to connect, then starts training automatically.
+Do not run both scripts at once — the WebSocket port (`8765`) is fixed, so the second
+process fails to bind.
+
+> **Still want `python -m http.server 8000`?** It works, but it sends no cache headers,
+> so after editing anything under `LF/` Chrome may serve the old copy until you hard
+> reload (`Ctrl+Shift+R`). That is the only reason `serve.py` exists.
+
+For the full Chinese troubleshooting guide (background throttling, round detection,
+page reloads, manual play, watching demos), see [TRAINING_FIXES.md](TRAINING_FIXES.md).
 
 ---
 
@@ -117,5 +171,5 @@ Special moves are packed as single atomic actions — no key-sequence learning r
 
 ## Acknowledgements
 
-This project builds on [F.LF](https://github.com/Project-F/F.LF) by Project-F, which provides the HTML5 game engine, character sprites, and physics. We modified `match.js` to broadcast game state over WebSocket and added the entire `lf2_rl/` directory for RL training.
+This project builds on [F.LF](https://github.com/Project-F/F.LF) by Project-F, which provides the HTML5 game engine, character sprites, and physics. We modified `match.js` to broadcast game state over WebSocket and added the entire `lf2-rl/` directory for RL training.
 
