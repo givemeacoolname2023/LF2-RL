@@ -410,13 +410,14 @@ netstat -ano | findstr :8765
 
 ## 11. 已知限制（这次没做）
 
-1. **没有断点续训**：`train_DQN.py` 只能从头训练；`checkpoints/` 里每 100 局（评估提升时）和每 500 局会存模型，但没有加载入口。
-2. **评估很慢**：每 100 局跑 20 局评估（`EVAL_EPISODES=20`），按每局 30 秒算约 10 分钟。
-3. **截断被当成终止**：帧超时（`timeout`）和到达步数上限（`max_steps`）时 `truncated=True`，而 `train_DQN.py` 用 `done = terminated or truncated`，所以 DQN 计算 target 时不会 bootstrap，长期回报会被略微低估。对结果影响不大，但写报告时要说明这一点。
-4. **浏览器崩溃不会自动拉起**：环境只会报 `TimeoutError`。训练前先确认 `http://127.0.0.1:9222` 能打开。
-5. **`--visible` 且 URL 带 `headless` 时画面是空的**（跳过渲染）。想看画面要去掉 `?headless`，代价是帧率下降。
-6. **`?headless` 的意义**是跳过 canvas 渲染提速（`match.js:354`）。无头模式下渲染本来也没人看，所以默认就带上了。
-7. **PPO 只做了短程验证**（2048 步），没有长跑 500k；长跑前建议确认磁盘够放 `logs/PPO_*`。
+1. ~~**没有断点续训**~~ —— **已补（§18）**：`python train_DQN.py --resume`，见 §18.3。
+2. **评估仍然占掉约 10% 的墙钟时间**：每 100 局跑 10 局（`EVAL_EPISODES=10`，原来是 20），按每局 45 秒算约 7 分钟一次，整轮 5000 局下来约 6 小时。`time/eval_frac` 曲线会实测这个比例。
+3. ~~**截断被当成终止**~~ —— **已修（§17.2）**：`buffer.push(..., float(terminated))`，截断的下一步照样 bootstrap。`done = terminated or truncated` 只剩循环控制的作用。
+4. **Replay buffer 不进 checkpoint**：`last.pt` / `ep{N}.pt` 只存网络 + optimizer + 步数。续训后前 64 步不更新（`update()` 有 `len(buffer) < BATCH_SIZE` 守卫），之后正常。要连经验池一起存会多几十 MB，目前没做。
+5. **浏览器崩溃不会自动拉起**：环境只会报 `TimeoutError`（`train_DQN.py` 会先把现场存成 `checkpoints/interrupted.pt` 再抛）。训练前先确认 `http://127.0.0.1:9222` 能打开。
+6. **`--visible` 且 URL 带 `headless` 时画面是空的**（跳过渲染）。想看画面要去掉 `?headless`，代价是帧率下降。
+7. **`?headless` 的意义**是跳过 canvas 渲染提速（`match.js:354`）。无头模式下渲染本来也没人看，所以默认就带上了。
+8. **PPO 的断点续训没做**：SB3 的 checkpoint 只存策略，`train.py` 也没有 `--resume`。DQN 那条路线已经能续（§18.3），PPO 要对齐得自己写 resume 逻辑。
 
 ---
 
@@ -567,7 +568,8 @@ python train_DQN.py
 
 | 文件 | 何时写 |
 |---|---|
-| `best_model.pt` | 每次评估胜率创新高 |
+| `best_model.pt` | DQN：每次评估胜率创新高（`(胜率, 平均奖励)` 字典序破纪录） |
+| `best_model.zip` | PPO：每 10 万步贪婪评估 5 局，同样按 `(胜率, 平均奖励)` 破纪录（`LF2_BEST_EVERY=0` 可关） |
 | `ep500.pt` 等 | 每 500 局 |
 | `final_model.pt` | 训练结束 |
 
@@ -740,14 +742,54 @@ conda activate lf2rl
 tensorboard --logdir logs
 ```
 
-然后打开 `http://localhost:6006`。PPO 的 `ep_rew_mean`、`value_loss`、`entropy_loss` 都在里面；
-DQN 这条路线没接 TensorBoard，只能看终端输出。
+然后打开 `http://localhost:6006`。
+
+两条路线现在都写曲线，目录并列：
+
+| 路线 | 目录 | 写曲线的方式 |
+|---|---|---|
+| PPO（`train.py`） | `logs/PPO_1`、`logs/PPO_2` … | SB3 自带，`tensorboard_log="./logs/"` |
+| DQN（`train_DQN.py`） | `logs/DQN_1`、`logs/DQN_2` … | `SummaryWriter`，tag 命名对齐 SB3（见下） |
+
+PPO 的 `rollout/ep_rew_mean`、`train/value_loss`、`train/entropy_loss` 都在里面。
+
+DQN 的 tag（横轴一律是**训练步数** `total_steps`，所以能和 PPO 的 `total_timesteps` 直接叠图）：
+
+| Tag | 含义 |
+|---|---|
+| `rollout/ep_rew_mean` / `rollout/ep_len_mean` | 最近 100 局的 reward / 局长滑动均值（和 SB3 同名，可与 PPO 叠在一起看） |
+| `rollout/ep_win_rate` | 最近 100 局**训练回合**的胜率（含 ε 探索，不是评估口径） |
+| `rollout/ep_timeout_rate` | 最近 100 局被 3000 帧上限截断的比例 —— 僵局预警 |
+| `episode/reward` / `episode/length` | 单局原始值，不平滑 |
+| `explore/epsilon` | 当前 ε。**这条最值得先看**：它在 5 万步就压到 0.05，而整轮是 1090 万步 |
+| `explore/action_entropy` / `explore/action_rate/*` | 动作分布的熵（上限 ln11≈2.4）和 11 个动作各自占比，用来看探索有没有塌 |
+| `train/td_loss` / `train/q_mean` / `train/target_mean` / `train/grad_norm` | TD loss、Q 值、target 值、裁剪前梯度范数。`q_mean` 和 `target_mean` 越拉越开就是发散前兆 |
+| `eval/win_rate`（+`_ci_low`/`_ci_high`/`_decisive`/`best_win_rate`） | 每 100 局用贪婪策略跑 10 局的胜率，**和 `eval.py` 同口径** |
+| `eval/attack_rate` / `eval/mean_dist` / `eval/dealt` / `eval/taken` / `eval/avg_len` | 出招占比（随机基线 45.5%）、平均距离、打掉/挨打血量、局长 |
+| `eval/distinct_len` | 10 局里有几种不同局长。一直是 1 说明 deterministic 退化成同一条轨迹，CI 偏乐观 |
+| `time/fps` / `time/eval_frac` | 步速；以及评估累计占掉多少墙钟时间（默认约 10%） |
+
+同一个运行目录里还有两份纯文本记录（不装 TensorBoard 也能看，写报告直接引用）：
+
+| 文件 | 内容 |
+|---|---|
+| `logs/DQN_N/episodes.csv` | 每局一行：result / reward / steps / ε / loss / q_mean / target_mean / grad_norm / attack_rate / action_entropy / fps |
+| `logs/DQN_N/eval.csv` | 每轮评估一行：胜率 + Wilson CI、局长、出招占比、距离、打掉/挨打、11 个动作的计数 |
+| `logs/DQN_N/history.json` | 上面评估记录的 JSON 版，方便直接抄进报告 |
+
+> 断点续训默认写回**原来那个** `logs/DQN_N`，TensorBoard 会把同目录的多个事件文件按 step 合并成一条连续曲线。想另开一条就用 `--new-run`。
 
 ### 13.10 参数速查
 
 | 想改什么 | 改哪里 |
 |---|---|
 | 每局步数上限 | 环境变量 `LF2_MAX_STEPS`（默认 3000 帧） |
+| DQN 总局数 | `train_DQN.py --episodes N` 或环境变量 `LF2_EPISODES`（默认 5000） |
+| DQN 评估频率 / 局数 | `--eval-every` / `--eval-episodes` 或 `LF2_EVAL_EVERY`（100）/ `LF2_EVAL_EPISODES`（10） |
+| DQN 存档间隔 | `--ckpt-every` 或 `LF2_CKPT_EVERY`（默认每 100 局写 `last.pt`）；`LF2_FULL_CKPT_EVERY` 控制 `ep{N}.pt`（500） |
+| DQN 断点续训 | `python train_DQN.py --resume [路径]`，不写路径用 `checkpoints/last.pt` |
+| DQN 日志目录 | `--log-dir` 或 `LF2_LOG_DIR`；`--no-tb` 关闭；`LF2_LOG_WINDOW` 调滑动窗口（100） |
+| DQN ε 衰减步数 | 环境变量 `LF2_EPSILON_DECAY`（默认 50000；见 §17.6 的风险提示） |
 | PPO 训练步数 | 环境变量 `LF2_TIMESTEPS`（`train.py:9` 默认 200000） |
 | `train.py` 打印的端口 | 环境变量 `LF2_PORT`（默认 8000，只影响提示文字） |
 | 观测（13 维） | `env.py` 的 `_state_to_obs` / `OBS_SCALE` |
@@ -758,7 +800,9 @@ DQN 这条路线没接 TensorBoard，只能看终端输出。
 | 浏览器参数 | `launch_browser.py --help`（`--visible` / `--port` / `--path` / `--browser` / `--devtools-port`） |
 | 评估跑几局 | `eval.py --episodes N`（默认 20） |
 | 评估用哪个模型 | `eval.py --model checkpoints/ppo_xxxxx_steps.zip`（默认取 checkpoints/ 里步数最大的） |
-| 评估时是否采样 | `eval.py --stochastic`（不加 = argmax，加 = 按策略分布采样） |
+| 评估 DQN 模型 | `eval.py --algo dqn --model checkpoints/best_model.pt`（`--algo auto` 会按 `.zip`/`.pt` 自动判断） |
+| 评估时是否采样 | `eval.py --stochastic`（不加 = argmax，加 = 按策略分布采样；DQN 用 `softmax(Q/T)`，`--temperature` 调 T） |
+| 评估结果存 JSON | `eval.py --json out.json` |
 
 ### 13.11 收尾
 
@@ -1212,3 +1256,212 @@ if ($.match.time.t % 12 === 0) {
 所以 `--stochastic` 是个有用的诊断开关（能说明卡死是确定性造成的），
 但**不是修复**。真正的修复还是 16.6 结尾那条：把坐标归一化改对，重新训练。
 
+---
+
+## 17. DQN 能不能跑、要多久：截断 bug 修复 + 10 分钟实测标定（2026-11-07）
+
+### 17.1 现象
+
+PPO 重训到 1.2M 步（`logs/PPO_15`）终于第一次打出伤害（打掉 311 / 挨打 522，
+0 胜），但要判断换 `train_DQN.py` 值不值得，得先回答两件事：**它能不能跑对**、
+**5000 局到底要几天**。原来的「约 4 天」里，「平均局长」是估的、「DQN 步速」是
+从一次间接测量推的，两个都是误差源。
+
+### 17.2 原因 / 修法：`train_DQN.py` 把「截断」当成了「死亡」
+
+```python
+next_obs, reward, terminated, truncated, info = env.step(action)
+done = terminated or truncated
+buffer.push(obs, action, reward, next_obs, float(done))   # ← 原来
+```
+
+`update()` 里 `target = r + GAMMA * next_q * (1 - done)`。把 `truncated`
+（3000 帧步数上限、以及 `env.step()` 的帧超时）也写成 `done=1`，等于告诉网络
+「走到 3000 帧之后世界就结束了，后面没有任何收益」。后果是**所有需要拖时间的
+策略（躲开等破绽、后手反击）被系统性低估，速攻换血被高估** —— 正好和 PPO
+现在卡住的那个坑是同一种病。
+
+改法只动一行（循环里的 `done` 保持不变，它还要用来退出 while）：
+
+```python
+buffer.push(obs, action, reward, next_obs, float(terminated))
+```
+
+`evaluate()` 里的 `done = terminated or truncated` 是循环控制，不动。
+
+### 17.3 标定方法：`lf2-rl/dqn_bench.py`（新增）
+
+复用 `train_DQN.py` 的 `QNetwork / ReplayBuffer / select_action / update /
+get_epsilon`，主循环与其真正的主循环逐行一致（reset → ε-greedy → step → push →
+过 warmup 后每步 update → 每 1000 步同步 target）。三处不同：不做周期评估、
+不写任何文件、跑满 `--minutes` 就停。分项计时等帧 / 前向 / 反向 / 页面重载。
+
+```bash
+python dqn_bench.py              # 10 分钟
+python dqn_bench.py --minutes 3  # 冒烟
+```
+
+### 17.4 实测（本机，10.0 分钟，15 局，26,541 步）
+
+| 量 | 实测值 |
+|---|---|
+| 端到端步速 `R_e2e` | **44.23 步/秒** |
+| 纯步速 `R_step`（扣掉重载） | 45.37 步/秒 |
+| PPO_15 步速（checkpoint 时间戳反推） | 41.70 步/秒 |
+| 平均局长（14 局完整 + 1 局截半 = 15） | 1769 帧（14 局完整时 1823 帧） |
+| 局长分布 | 最短 636 / 中位 1610 / 最长 3000 |
+| 平均每次 `update()` | 2.90 毫秒 |
+| 梯度更新次数 | 25,542（≈每步一次） |
+
+时间构成：
+
+| 项 | 秒 | 占比 |
+|---|---|---|
+| 等帧 `env.step()` | 509.0 | 84.8% |
+| 更新 `update()` | 74.1 | 12.4% |
+| 重载 `env.reset()` | 15.1 | 2.5% |
+| 选动作 `select_action()` | 1.5 | 0.2% |
+
+**关键读数**：一次循环 = 等帧 19.2 ms + 更新 2.9 ms + 选动作 0.06 ms = **22.2 ms**，
+正好等于浏览器的一帧。也就是说**梯度更新被等帧的余量完整吃掉了** ——
+把 update 去掉，步速仍然是 45 步/秒；就算 update 慢到 15 ms 也一样。
+所以 DQN 慢不慢**和 CPU 线程数无关，瓶颈完全在游戏自身的帧率**。
+实测 DQN 甚至比 PPO 快 6%（44.2 vs 41.7），因为 SB3 每 2048 步要做 5 个 epoch、
+32 个 minibatch 的更新，平均下来比 DQN 的单步更新更重。
+
+### 17.5 工期推算
+
+```
+总步数 = 5000 局 × L + (5000/100) 次评估 × 20 局 × L = 6000 × L
+L = 1823（14 局完整实测平均）→ 10,935,000 步
+总时长 = 10,935,000 / 44.23 ≈ 247,000 秒 ≈ 68.7 小时 ≈ 2.86 天
+```
+
+敏感度（局长随学到的策略变化，这是最大的不确定项）：
+
+| 学习结果 | 平均局长 | 总时长 |
+|---|---|---|
+| 学会赢（一局 ~13 秒） | ~600 | **0.9 天** |
+| 和随机策略差不多（实测） | ~1820 | **2.9 天** |
+| 学会僵持（每局跑满上限） | 3000 | **4.7 天** |
+
+注意这个标定用的策略 ε 从 1.0 只降到 0.62（10 分钟 ≈ 2.6 万步），**基本上是随机
+乱按**，15 局输了 14 局、Dennis 血几乎不掉（大多剩 300–500）。所以它测的是
+**速度和局长**，不是学习效果。
+
+### 17.6 结论
+
+1. **管道是通的**，修完 bootstrap 之后 10 分钟跑了 15 完整局，没有崩、没有卡死。
+2. **工期 ≈ 2.9 天**（区间 0.9–4.7 天），不是 4 天。
+3. **步速不是瓶颈**，和 PPO 同量级；瓶颈是游戏 45 帧/秒的实时时钟。
+4. 5000 局 ≈ 1090 万步，是 PPO 这轮 120 万步的 **8.8 倍经验**；
+   DQN 还是 off-policy（每条经验回放约 85 次），且 Q-learning 优化的
+   本身就是 greedy 策略 —— 部署时取 argmax 和训练目标一致，没有 PPO
+   那个「训练随机策略、部署取 argmax」的结构性错位。
+5. **风险**：`EPSILON_DECAY = 50_000` 在整个 1090 万步里只占 0.46%，
+   ε 在第 5 万步就压到 0.05，之后几乎没有探索。这是一次 3 天的单次下注，
+   中途发现锁死就白费。真要跑，建议先把 `EPSILON_DECAY` 提到总量的
+   10%–20%（约 1–2M 步），但那属于超参改动，本次未实施。
+
+
+---
+
+## 18. DQN 的训练曲线、离线评估、断点续训（2026-11-08）
+
+### 18.1 现象
+
+PPO 有曲线（`logs/PPO_N`）也有 `eval.py`，DQN 两样都没有：
+`train_DQN.py` 只能 `print()` 到终端；`evaluate()` 埋在训练循环里只返回两个数；
+`eval.py` 只认 `PPO.load()` 的 `.zip`，`pve.py:117` 还显式拒绝 `.pt`；
+checkpoint 只存裸 `state_dict`，**2.9 天的长跑崩一次就得从头再来**。
+
+于是「DQN 到底学到什么程度」这个问题没有答案：既没有趋势，也没有绝对水平，还不能中途续。
+
+### 18.2 改了什么
+
+| 文件 | 状态 | 改动 |
+|---|---|---|
+| `lf2-rl/rl_metrics.py` | 新增 | 观测下标（`IDX_D_HP/IDX_E_HP/IDX_DX`）、`ATTACK_ACTIONS`、`RANDOM_ATTACK_RATE`、`wilson()`、`action_entropy()`、`action_name()`。**训练内评估和 `eval.py` 共用这一份**，两边口径不会漂 |
+| `lf2-rl/train_DQN.py` | 大改 | 接 `SummaryWriter` 写 `logs/DQN_N`；`evaluate()` 返回富指标 dict；checkpoint 改富格式（含 optimizer/total_steps/episode）并兼容旧裸 `state_dict`；`--resume` 续训；`Ctrl+C` / 异常时先存 `interrupted.pt`；`episodes.csv` / `eval.csv` / `history.json` 二次记录；`best_model.pt` 仍是裸 `state_dict`（§13.6 的加载片段保持可用） |
+| `lf2-rl/eval.py` | 改 | `--algo {auto,ppo,dqn}`（默认 auto，按 `.zip`/`.pt` 判断）；`QNetworkPolicy` / `PPOPolicy` 适配层，跑局统计那段代码一行没动；`--temperature`、`--json`；`latest_dqn_checkpoint()` |
+| `lf2-rl/pve.py` | 改 | 删掉「只支持 PPO 的 .zip」，改用同一个适配层，DQN 的 `.pt` 也能真人对打 |
+| `lf2-rl/smoke_dqn.py` | 新增 | **不开浏览器的**端到端冒烟：假环境跑真训练循环 + 真 TensorBoard + 真续训，30 秒出结果 |
+| `lf2-rl/dqn_bench.py` | 不动 | 它的导入契约（`QNetwork/ReplayBuffer/update/EPISODES/EVAL_EPISODES` 等）一条没破；`EVAL_EPISODES` 默认 20→10 会让它的工期推算同步变小，这是预期 |
+
+几个设计取舍：
+
+- **TensorBoard 用 `SummaryWriter` 而不是 SB3 的 `configure()`**：DQN 和 SB3 没有耦合，
+  `SummaryWriter` 三行就能用，而且能显式控制 `global_step`、`flush()`、`close()`。
+  所有标量的横轴统一是 `total_steps`，才能和 PPO 的 `total_timesteps` 叠在一张图上。
+- **每局写一次，不逐步写**：1090 万步 × 30 个 tag 会产生几亿个点，事件文件上 GB、CPU 也有开销。
+  按局聚合后每 tag 5000 个点，画三天的曲线足够了。
+- **评估从 20 局降到 10 局**（`LF2_EVAL_EPISODES` 可改回）：评估会实打实占用浏览器墙钟，
+  20 局要 14 小时（总工期的 20%），10 局省一半。代价是 CI 变宽（p=0.1 时半宽 0.137 → 0.193），
+  所以**报告里引用绝对胜率时用 `eval.py --episodes 100` 单独跑**，训练曲线只看趋势。
+  另外胜率相同时改为比 `avg_reward`，避免 best 停在 10% 的噪声高点。
+- **`best_win_rate` 初值陷阱**：原来严格 `>` 且初值 0.0，第一轮评估如果一局没赢，
+  `best_model.pt` 根本不会生成（`eval.py` 默认找模型就落空）。现在改成 `(win_rate, avg_reward)` 元组比较，
+  `avg_reward` 初值 `-inf`，所以 0% 胜率也会落一个 best。
+- **存档先写 `.tmp` 再 `os.replace`**：三天训练里 `best_model.pt` 是唯一值得留的东西，
+  中途被 Ctrl+C 打断不能留下半截文件。
+- **和评估节奏解耦**：原来 `ep{N}.pt` 嵌在 `if episode % EVAL_EVERY == 0` 里面，
+  把 `LF2_EVAL_EVERY` 调大（比如 200）会让 500 局的存档静默失效。现在存档独立判断。
+
+### 18.3 断点续训怎么用
+
+```bat
+REM 中途 Ctrl+C 后（会存 checkpoints/interrupted.pt）
+python train_DQN.py --resume checkpoints/interrupted.pt
+
+REM 或者直接接着最近一次的 last.pt（每 100 局自动写）
+python train_DQN.py --resume
+
+REM 想另开一条 TensorBoard 曲线
+python train_DQN.py --resume checkpoints/last.pt --new-run
+```
+
+- 恢复：网络权重、target 网络、optimizer 状态、`total_steps`、`episode`、`best_win_rate`。
+- **ε 不用存**：`get_epsilon(total_steps)` 是纯函数，恢复步数就自动接着衰减 —— 这是续训代价极低的原因。
+- **经验池不存**：续训后前 64 步不更新，之后恢复正常。
+- 默认写回**原来那个** `logs/DQN_N`，所以曲线是连续的（同目录多个事件文件按 step 合并）。
+- 从旧的裸 `state_dict`（比如 `best_model.pt`）续训也能跑，但 optimizer 动量重新开始累计，会打印提示。
+
+### 18.4 验收记录（本机实测，2026-11-08）
+
+**A. 无浏览器冒烟**（`python smoke_dqn.py`，30 秒）
+
+| 检查项 | 结果 |
+|---|---|
+| 真训练循环 + 真 TB 写入器（假环境每步瞬时） | ✅ 两轮共 10 局，51 个标量，22 个 `action_rate` |
+| `last.pt` / `best_model.pt` / `ep{N}.pt` / `final_model.pt` 全部落盘 | ✅ |
+| `best_model.pt` 仍是裸 `state_dict` 且能被 `load_state_dict` 吃下 | ✅ |
+| `episodes.csv` / `eval.csv` / `history.json` | ✅ |
+| 续训接着局数跑、`total_steps` 不清零、事件文件落在同一目录 | ✅（6 局 → 10 局，558 → 934 步，2 个事件文件） |
+| 旧格式裸 `state_dict` 被识别成 `format=1` | ✅ |
+
+**B. 真游戏短程**（`serve.py:8010` + `launch_browser.py:8010`，`LF2_MAX_STEPS=400`）
+
+| 检查项 | 结果 |
+|---|---|
+| `train_DQN.py --episodes 2 --eval-every 2` | ✅ 2 局各 400 帧截断，33 fps，评估 2 局 |
+| 训练曲线 | ✅ 51 个标量；`explore/epsilon` 0.9924→0.9848；`rollout/ep_win_rate` 0；`time/fps` 33 |
+| 训练期出招占比 | ✅ 0.445（随机基线 0.455）—— 未训练时确实接近随机 |
+| `eval.py --algo dqn --model checkpoints/best_model.pt` | ✅ 完整报告 + `--json`；动作分布 `down` 75.4% / `right` 24.6% |
+| `eval.py`（不带 `--algo`，auto→PPO）回归 | ✅ 行为与改动前一致（出招 89.8%，距离 215px） |
+| `train_DQN.py --resume` 真续训 | ✅ 「已完成 2 局 / 800 步，从第 3 场开始」，写回同一个 `DQN_2`，`episodes.csv` 从 2 行续到 4 行，`total_steps` 800→1600 |
+| `dqn_bench.py` 导入契约 | ✅ `import train_DQN, dqn_bench` 正常，`EPISODES=5000 / EVAL_EPISODES=10` |
+
+**C. 顺手修掉的一个坑**
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| `python train_DQN.py > log.txt` 直接 `UnicodeEncodeError: 'gbk' codec can't encode '🏆'` | Windows 重定向时 stdout 用 GBK，`🏆` 编不出来。三天长跑基本都会重定向，等于一启动就崩 | `train()` / `eval.py` 启动时 `sys.stdout.reconfigure(encoding='utf-8', errors='replace')` |
+
+### 18.5 还没做的
+
+1. **PPO 没有断点续训**（SB3 的 `save` 只存策略，`train.py` 没有 `--resume`）。
+2. **Replay buffer 不进存档**（多几十 MB 且慢）。真要的话在 `save_checkpoint` 里把
+   `deque` 拼成张量存进 `ep{N}.pt` 即可，`update()` 的守卫已经能容忍空池。
+3. **`EPSILON_DECAY=50000` 没动**（§17.6 指出它只占总量 0.46%，是个真风险）。
+   这次只加了 `LF2_EPSILON_DECAY` 覆盖开关和 `explore/epsilon` 曲线，把问题**变得可见**，
+   超参本身该不该改是实验设计决定，不夹在日志改动里偷改。

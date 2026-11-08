@@ -33,10 +33,10 @@ import sys
 import time
 
 import websockets
-from stable_baselines3 import PPO
 
 from env import ACTION_KEYS, state_to_obs
-from eval import latest_checkpoint, resolve_model, ws_port_busy
+from eval import (build_policy, detect_algo, latest_checkpoint,
+                  latest_dqn_checkpoint, resolve_model, ws_port_busy)
 
 WS_PORT = 8765
 
@@ -90,7 +90,9 @@ def main():
     parser = argparse.ArgumentParser(
         description='真人对模型：模型操控左边的 Davis，你用键盘操控右边的 Dennis')
     parser.add_argument('--model', default=None,
-                        help='模型路径，.zip 可省；默认取 checkpoints/ 里步数最大的')
+                        help='模型路径，.zip / .pt 后缀可省；默认按 --algo 取 checkpoints/ 下的模型')
+    parser.add_argument('--algo', choices=('auto', 'ppo', 'dqn'), default='auto',
+                        help='ppo 读 .zip，dqn 读 .pt；auto 按扩展名判断（默认）')
     parser.add_argument('--device', default='cpu', help='推理设备（默认 cpu）')
     parser.add_argument('--heartbeat', type=float, default=2.0,
                         help='每隔几秒打印一次双方血量（0 = 不打印，默认 2）')
@@ -101,22 +103,25 @@ def main():
                              '采样能打破这个循环。')
     args = parser.parse_args()
 
-    # ---- 1. 找模型 ----
+    # ---- 1. 找模型（PPO 的 .zip 和 DQN 的 .pt 都行）----
     if args.model:
         model_path = resolve_model(args.model)
         if model_path is None:
             print(f'[错误] 找不到模型：{args.model}')
             return 1
+    elif args.algo == 'dqn':
+        model_path = latest_dqn_checkpoint()
+        if model_path is None:
+            print('[错误] checkpoints/ 下没有 .pt。先用 train_DQN.py 训练。')
+            return 1
     else:
         model_path = latest_checkpoint()
         if model_path is None:
             print('[错误] checkpoints/ 下没有 .zip。先用 train.py 训练，'
-                  '或改用 --model lf2_ppo.zip')
+                  '或改用 --model lf2_ppo.zip；要比 DQN 就加 --algo dqn')
             return 1
 
-    if model_path.lower().endswith('.pt'):
-        print('[错误] pve.py 目前只支持 PPO 的 .zip。DQN 的 .pt 权重还不支持。')
-        return 1
+    algo = detect_algo(model_path) if args.algo == 'auto' else args.algo
 
     # ---- 2. 端口预检 ----
     if ws_port_busy():
@@ -125,9 +130,14 @@ def main():
         return 1
 
     # ---- 3. 加载模型（不需要 env，纯推理）----
-    model = PPO.load(model_path, device=args.device)
-    print(f'[模型] {model_path}')
-    print(f"[策略] {'采样 stochastic' if args.stochastic else 'argmax deterministic'}")
+    try:
+        model = build_policy(algo, model_path, device=args.device,
+                             stochastic=args.stochastic)
+    except Exception as e:
+        print(f'[错误] 加载模型失败：{type(e).__name__}: {e}')
+        return 1
+    print(f'[模型] {model_path}    [算法] {algo.upper()}')
+    print(f'[策略] {model.describe()}')
     print('[键位] 你操作右边的 Dennis：U 上 / M 下 / H 左 / K 右 / I 跳 / , 防 / J 攻')
     print('[提示] 页面要用 ?pve 打开，并且浏览器要 --visible（画面得看得见）')
     print('[重启] 打完一局按 F5 重开，本脚本不用重启')

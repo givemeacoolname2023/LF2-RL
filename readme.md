@@ -133,6 +133,34 @@ The script waits for the browser to connect, then starts training automatically.
 Do not run both scripts at once — the WebSocket port (`8765`) is fixed, so the second
 process fails to bind.
 
+**6. Watch the curves, evaluate, resume**
+
+```bash
+# Both algorithms write TensorBoard runs side by side: logs/PPO_*, logs/DQN_*
+tensorboard --logdir logs
+
+# Evaluate either checkpoint type (auto-detected: .zip → PPO, .pt → DQN)
+python eval.py --algo ppo --model checkpoints/best_model.zip   # best greedy win rate
+python eval.py --model lf2_ppo.zip                             # merely the last one
+python eval.py --algo dqn --model checkpoints/best_model.pt --episodes 100 --json out.json
+
+# Resume a DQN run from where it stopped (Ctrl+C now saves interrupted.pt first)
+python train_DQN.py --resume
+```
+
+DQN also writes `logs/DQN_N/episodes.csv`, `eval.csv` and `history.json`, so the numbers
+are readable without TensorBoard. The in-training `eval/*` scalars use the same metric
+definitions as `eval.py` (`rl_metrics.py`), so the two can be quoted interchangeably.
+
+Both trainers now keep a `best_model`: DQN writes `checkpoints/best_model.pt` on every
+eval that beats the previous `(win rate, avg reward)`, and PPO writes
+`checkpoints/best_model.zip` after a greedy eval every 100k steps
+(`LF2_BEST_EVERY=0` disables it, `LF2_BEST_EPISODES=5` sets the episodes per eval).
+PPO's in-training numbers land in `logs/PPO_N/ppo_eval.csv`.
+
+`python smoke_dqn.py` runs the whole DQN pipeline against a fake env in ~30 s — no
+browser needed — and asserts the TensorBoard tags, CSVs and resume behaviour.
+
 > **Still want `python -m http.server 8000`?** It works, but it sends no cache headers,
 > so after editing anything under `LF/` Chrome may serve the old copy until you hard
 > reload (`Ctrl+Shift+R`). That is the only reason `serve.py` exists.

@@ -1,5 +1,5 @@
 """
-eval.py —— 用训好的 PPO 模型打 N 局，统计胜率和行为特征。
+eval.py —— 用训好的模型（PPO 或 DQN）打 N 局，统计胜率和行为特征。
 
 为什么需要它：
     train.py 只打 ep_rew_mean，而那个指标会被「距离奖励」灌水 ——
@@ -14,7 +14,13 @@ eval.py —— 用训好的 PPO 模型打 N 局，统计胜率和行为特征。
     python eval.py --model lf2_ppo.zip --episodes 50     # 跑指定的模型
     set LF2_MAX_STEPS=400 && python eval.py --episodes 2 # 短局冒烟，几分钟跑完
 
-耗时：一局 2000~3000 帧，约 45 帧/秒，也就是 45~65 秒。20 局约 20 分钟。
+    
+评估可视化
+# 终端 A（serve.py）—— 全程不用管，一直在跑
+# 终端 B
+python launch_browser.py --port 8010 --visible --path "/LF2-RL/game/game.html?debug"
+# 终端 C
+python eval.py --episodes 1
 
 不做的事：
     不修改 env.py / train.py，只读地用它们。模型是 deterministic 选动作（不打采样噪声），
@@ -23,7 +29,7 @@ eval.py —— 用训好的 PPO 模型打 N 局，统计胜率和行为特征。
 
 import argparse
 import glob
-import math
+import json
 import os
 import re
 import socket
@@ -31,20 +37,20 @@ import sys
 import time
 from collections import Counter
 
-from stable_baselines3 import PPO
+import numpy as np
+import torch
 
 from env import ACTION_KEYS, LF2Env, OBS_SCALE
 
-# 观测里的下标（对应 env.py 的 _state_to_obs）
-IDX_D_HP = 2    # davis hp  = obs[2] * OBS_SCALE[2]
-IDX_E_HP = 8    # dennis hp = obs[8] * OBS_SCALE[8]
-IDX_DX = 12     # dx        = obs[12] * OBS_SCALE[12]
-
-# 含 'att' 的动作算一次出招：5=攻 7=左攻 8=右攻 9=跳攻 10=下攻
-ATTACK_ACTIONS = sorted(i for i, keys in enumerate(ACTION_KEYS) if 'att' in keys)
-RANDOM_ATTACK_RATE = len(ATTACK_ACTIONS) / len(ACTION_KEYS)
+# 观测下标 / 出招判定 / Wilson CI 统一定义在 rl_metrics.py，
+# 因为 train_DQN.py 的 evaluate() 也要用同一套口径，两边不能各写一份。
+from rl_metrics import (        # noqa: F401 —— 这些名字仍然是 eval.py 的公开属性
+    ATTACK_ACTIONS, IDX_D_HP, IDX_DX, IDX_E_HP,
+    RANDOM_ATTACK_RATE, action_name, wilson,
+)
 
 WS_PORT = 8765
+
 
 
 def ws_port_busy(port=WS_PORT):
@@ -66,15 +72,22 @@ def ws_port_busy(port=WS_PORT):
 
 
 def resolve_model(path):
-    """把 --model 补成真实存在的路径；找不到返回 None。"""
-    for cand in (path, path + '.zip'):
+    """把 --model 补成真实存在的路径；找不到返回 None。.zip（PPO）和 .pt（DQN）都试。"""
+    for cand in (path, path + '.zip', path + '.pt'):
         if os.path.isfile(cand):
             return cand
     return None
 
 
 def latest_checkpoint(folder='checkpoints'):
-    """checkpoints/ 里步数最大的那个，找不到返回 None。"""
+    """PPO：优先 checkpoints/best_model.zip，否则取步数最大的 .zip，找不到返回 None。
+
+    和 latest_dqn_checkpoint() 的优先级保持一致 —— 训练中贪婪评估胜率最高的那个，
+    才是报告里要引用的模型；最后那个 lf2_ppo.zip 只代表「跑完了」，不代表「最好」。
+    """
+    preferred = os.path.join(folder, 'best_model.zip')
+    if os.path.isfile(preferred):
+        return preferred
     best, best_step = None, -1
     for f in glob.glob(os.path.join(folder, '*.zip')):
         m = re.search(r'_(\d+)_steps', os.path.basename(f))
@@ -84,15 +97,114 @@ def latest_checkpoint(folder='checkpoints'):
     return best
 
 
-def wilson(k, n, z=1.96):
-    """二项比例的 Wilson 置信区间。小样本下比正态近似靠谱得多。"""
-    if n == 0:
-        return 0.0, 0.0
-    p = k / n
-    denom = 1 + z * z / n
-    centre = (p + z * z / (2 * n)) / denom
-    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
-    return max(0.0, centre - half), min(1.0, centre + half)
+def latest_dqn_checkpoint(folder='checkpoints'):
+    """DQN：按「最可能想要」的顺序挑一个 .pt，找不到返回 None。
+
+    best_model.pt 是评估胜率最高那次的裸 state_dict，报告里引用的一般就是它；
+    没有的话退到 final_model.pt / last.pt，再退到 ep{N}.pt 里 N 最大的，
+    最后才按 mtime 取最新的 .pt（例如 interrupted.pt）。
+    """
+    for name in ('best_model.pt', 'final_model.pt', 'last.pt', 'interrupted.pt'):
+        p = os.path.join(folder, name)
+        if os.path.isfile(p):
+            return p
+
+    best, best_n = None, -1
+    for f in glob.glob(os.path.join(folder, 'ep*.pt')):
+        m = re.search(r'ep(\d+)\.pt$', os.path.basename(f))
+        if m and int(m.group(1)) > best_n:
+            best, best_n = f, int(m.group(1))
+    if best:
+        return best
+
+    pts = glob.glob(os.path.join(folder, '*.pt'))
+    return max(pts, key=os.path.getmtime) if pts else None
+
+
+def detect_algo(model_path):
+    """按扩展名猜算法：.pt → dqn，其余（.zip）→ ppo。"""
+    return 'dqn' if model_path.lower().endswith('.pt') else 'ppo'
+
+
+class QNetworkPolicy:
+    """把 DQN 的 .pt 包成和 SB3 的 model.predict() 一样的接口。
+
+    这样下面「跑 N 局统计」那段代码一行都不用改，PPO 和 DQN 的评估口径天然一致。
+    """
+
+    def __init__(self, model_path, device='cpu', stochastic=False, temperature=1.0):
+        # 延迟导入：只在真的要评 DQN 时才拖进 torch 训练模块
+        from train_DQN import ACT_DIM, OBS_DIM, QNetwork, load_checkpoint
+
+        self.device = torch.device(device)
+        self.stochastic = stochastic
+        self.temperature = max(1e-6, float(temperature))
+
+        ckpt = load_checkpoint(model_path, device=self.device)
+        cfg = ckpt.get('config') or {}
+        obs_dim = int(cfg.get('obs_dim', OBS_DIM))
+        act_dim = int(cfg.get('act_dim', ACT_DIM))
+
+        self.net = QNetwork(obs_dim, act_dim).to(self.device)
+        self.net.load_state_dict(ckpt['model'])
+        self.net.eval()
+
+        self.meta = {'algo': 'dqn', 'format': ckpt.get('format'),
+                     'episode': ckpt.get('episode'), 'total_steps': ckpt.get('total_steps'),
+                     'best_win_rate': ckpt.get('best_win_rate')}
+
+    def predict(self, obs, deterministic=True):
+        with torch.no_grad():
+            q = self.net(torch.as_tensor(np.asarray(obs), dtype=torch.float32)
+                         .unsqueeze(0).to(self.device))[0]
+        if deterministic or not self.stochastic:
+            return int(q.argmax().item()), None
+        # DQN 没有可采样的策略分布，这里用 softmax(Q/T) 近似 —— 它测的是
+        # 「argmax 策略有多脆」，不能和 PPO 的「按策略分布采样」当同一个口径比。
+        probs = torch.softmax(q / self.temperature, dim=-1)
+        return int(torch.multinomial(probs, 1).item()), None
+
+    def describe(self):
+        """一句话说明这个模型是怎么选动作的。"""
+        if self.stochastic:
+            return f'DQN softmax(Q/{self.temperature:g}) 采样'
+        return 'DQN argmax deterministic'
+
+
+class PPOPolicy:
+    """薄包装，让 PPO 也被传进来的 env 一致地处理（保持原有行为）。"""
+
+    def __init__(self, model_path, env=None, device='cpu', stochastic=False):
+        from stable_baselines3 import PPO
+        self.model = PPO.load(model_path, env=env, device=device)
+        self.stochastic = stochastic
+        self.meta = {'algo': 'ppo'}
+
+    def predict(self, obs, deterministic=True):
+        action, _ = self.model.predict(obs, deterministic=deterministic)
+        return int(action), None
+
+    def describe(self):
+        return ('PPO 采样 stochastic' if self.stochastic
+                else 'PPO argmax deterministic')
+
+
+def build_policy(algo, model_path, env=None, device='cpu', stochastic=False,
+                 temperature=1.0):
+    if algo == 'dqn':
+        return QNetworkPolicy(model_path, device=device,
+                              stochastic=stochastic, temperature=temperature)
+    return PPOPolicy(model_path, env=env, device=device, stochastic=stochastic)
+
+
+def _ensure_utf8_stdout():
+    """重定向到文件 / 管道时 Windows 会用 GBK 编码 stdout，中文和 emoji 会抛
+    UnicodeEncodeError。训练和评估都跑很久，输出一般都要存盘，先修好。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:                       # noqa: BLE001
+            pass
 
 
 def fmt_eta(seconds):
@@ -104,16 +216,25 @@ def fmt_eta(seconds):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='用训好的 PPO 模型打 N 局，统计胜率与行为特征')
+        description='用训好的模型（PPO 或 DQN）打 N 局，统计胜率与行为特征')
     parser.add_argument('--model', default=None,
-                        help='模型路径，.zip 可省；默认取 checkpoints/ 里步数最大的')
+                        help='模型路径，.zip / .pt 后缀可省；'
+                             '默认按 --algo 取 checkpoints/ 下的模型')
+    parser.add_argument('--algo', choices=('auto', 'ppo', 'dqn'), default='auto',
+                        help='ppo 读 .zip，dqn 读 .pt；auto 按扩展名判断（默认）')
     parser.add_argument('--episodes', type=int, default=20, help='跑几局（默认 20）')
     parser.add_argument('--device', default='cpu', help='推理设备（默认 cpu，13 维 MLP 用不上 GPU）')
     parser.add_argument('--stochastic', action='store_true',
                         help='按策略分布采样选动作，而不是取 argmax。'
                              '默认 deterministic：每局几乎一模一样，20 局约等于同一条轨迹跑 20 遍；'
-                             '加这个开关才看得出策略的真实方差（也要用它才能和训练时的表现对比）。')
+                             '加这个开关才看得出策略的真实方差（也要用它才能和训练时的表现对比）。'
+                             'DQN 没有可采样的分布，用 softmax(Q/温度) 代替。')
+    parser.add_argument('--temperature', type=float, default=1.0,
+                        help='仅 DQN 的 --stochastic 用：softmax(Q/T) 的温度（默认 1.0）')
+    parser.add_argument('--json', default=None, metavar='PATH',
+                        help='把汇总结果另存为 JSON（写报告时引用）')
     args = parser.parse_args()
+    _ensure_utf8_stdout()
 
     # ---- 1. 找模型 ----
     if args.model:
@@ -121,12 +242,21 @@ def main():
         if model_path is None:
             print(f'[错误] 找不到模型：{args.model}')
             return 1
+    elif args.algo == 'dqn':
+        model_path = latest_dqn_checkpoint()
+        if model_path is None:
+            print('[错误] checkpoints/ 下没有 .pt。先用 train_DQN.py 训练。')
+            return 1
     else:
         model_path = latest_checkpoint()
         if model_path is None:
             print('[错误] checkpoints/ 下没有 .zip。先用 train.py 训练，'
-                  '或改用 --model lf2_ppo.zip')
+                  '或改用 --model lf2_ppo.zip；要评 DQN 就加 --algo dqn')
             return 1
+
+    algo = detect_algo(model_path) if args.algo == 'auto' else args.algo
+    if args.algo != 'auto' and detect_algo(model_path) != args.algo:
+        print(f'[提示] --algo {args.algo} 但文件是 {model_path}，按 --algo 处理。')
 
     # ---- 2. 端口预检（抢不到 8765 会表现成"等 120 秒后超时"，很难排查）----
     if ws_port_busy():
@@ -135,9 +265,8 @@ def main():
         print('       先把训练停掉（Ctrl+C），确认 netstat -ano | findstr :8765 没有输出，再运行本脚本。')
         return 1
 
-    print(f'[模型] {model_path}')
-    print(f'[局数] {args.episodes}    [设备] {args.device}    '
-          f"[选动作] {'采样 stochastic' if args.stochastic else 'argmax deterministic'}")
+    print(f'[模型] {model_path}    [算法] {algo.upper()}')
+    print(f'[局数] {args.episodes}    [设备] {args.device}')
     print(f'[提示] 需要 serve.py + 浏览器页面已打开；一局约 45~65 秒。')
     print()
 
@@ -147,7 +276,20 @@ def main():
     except Exception as e:
         print(f'[错误] 创建环境失败：{e}')
         return 1
-    model = PPO.load(model_path, env=env, device=args.device)
+    try:
+        model = build_policy(algo, model_path, env=env, device=args.device,
+                             stochastic=args.stochastic, temperature=args.temperature)
+    except Exception as e:
+        print(f'[错误] 加载模型失败：{type(e).__name__}: {e}')
+        env.close()
+        return 1
+
+    print(f'[选动作] {model.describe()}')
+    meta = getattr(model, 'meta', {}) or {}
+    if algo == 'dqn' and meta.get('episode') is not None:
+        print(f'[检查点] ep={meta.get("episode")}  steps={meta.get("total_steps")}  '
+              f'best_win_rate={meta.get("best_win_rate")}')
+    print()
 
     episodes = []
     action_counter = Counter()
@@ -234,8 +376,7 @@ def main():
 
     print()
     print('=' * 68)
-    print(f'评估结果：{model_path}，共 {n} 局，'
-          f"{'采样 stochastic' if args.stochastic else 'argmax deterministic'}")
+    print(f'评估结果：{model_path}，共 {n} 局，{algo.upper()}，{model.describe()}')
     print('=' * 68)
     line = f'胜 {wins} / 负 {loses} / 超时 {timeouts}'
     if frame_to:
@@ -274,7 +415,31 @@ def main():
         print(f'  {a:>2} {str(ACTION_KEYS[a]):<14} {c:>6}  {c / total_steps * 100:>5.1f}%  {bar}{tag}')
 
     print()
-    print(f'总耗时 {fmt_eta(time.time() - t_start)}')
+    elapsed = time.time() - t_start
+    print(f'总耗时 {fmt_eta(elapsed)}')
+
+    if args.json:
+        summary = {
+            'model': model_path, 'algo': algo,
+            'action_selection': model.describe(),
+            'n': n, 'wins': wins, 'loses': loses,
+            'timeouts': timeouts, 'frame_timeouts': frame_to, 'other': other,
+            'win_rate': wins / n, 'win_rate_ci': [lo, hi],
+            'win_rate_decisive': (wins / decisive) if decisive else None,
+            'mean_len': mean_steps, 'mean_dist': mean_dist,
+            'attack_rate': att_rate, 'random_attack_rate': RANDOM_ATTACK_RATE,
+            'mean_dealt': mean_dealt, 'mean_taken': mean_taken,
+            'distinct_len': n_distinct, 'elapsed_secs': round(elapsed, 1),
+            'action_counts': {action_name(a): c for a, c in action_counter.most_common()},
+            'checkpoint_meta': meta,
+        }
+        try:
+            with open(args.json, 'w', encoding='utf-8') as f:
+                json.dump(summary, f, ensure_ascii=False, indent=1)
+            print(f'汇总已写入 {args.json}')
+        except OSError as e:
+            print(f'[警告] 写 {args.json} 失败：{e}')
+
     return 0
 
 

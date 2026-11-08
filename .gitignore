@@ -2,5 +2,10 @@
 __pycache__/
 .claude/
 logs/
+logs_smoke/
 *.zip
 checkpoints/
+*.txt
+dqn_bench.py
+smoke_dqn.py
+smoke_ppo_best.py
