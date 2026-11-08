@@ -725,6 +725,24 @@ python launch_browser.py --port 8010 --visible --path "/LF2-RL/game/game.html?de
 跑起来之后，`train.py` / `train_DQN.py` / `eval.py` 的终端里会打印一次
 `[难度] Easy（对手 AI：dumbass）`——**看这一行就够了**，别靠记忆判断在打谁。
 
+**换难度不用重启浏览器。** `train.py` / `train_DQN.py` / `eval.py` 也接受
+`--diff easy|normal|difficult`：指定后 `env.py` 会通过 WebSocket 让已经打开的页面
+改写 URL 里的 `diff=N` 并重载，然后在第一局开始前校验 `state['difficulty']`。
+切不过去（页面没带 `?debug`、旧缓存的 `match.js` 等）会直接抛错，**不会带着错难度继续跑**。
+不传 `--diff` 就完全沿用页面设置，行为与以前一致。
+
+| 想做的事 | 命令 |
+|---|---|
+| 用 Difficult 训练 DQN | `python train_DQN.py --diff difficult` |
+| 用 Normal 训练 PPO | `python train.py --diff normal` |
+| 用 Difficult 评估 | `python eval.py --diff difficult --episodes 20` |
+| 用数字写法（等价） | `--diff 2` = `--diff difficult`、`1` = normal、`0` = easy |
+| 换难度 | Ctrl+C 停掉，改 `--diff` 重跑（浏览器不用动） |
+
+`--diff` 的名字和数字两种写法在 `train.py` / `train_DQN.py` / `eval.py` 和
+`launch_browser.py` 里都通用。**不传 `--diff` 就是默认的 Easy**（页面 URL 不带
+`diff` 参数时，`manager.js` 的 `difficulty_index()` 返回 0 → 对手 `dumbass`）。
+
 键位（玩家 1，见 `LF/manager.js:121`；`Settings` 里可以改）：
 
 | 动作 | 键 | 动作 | 键 |

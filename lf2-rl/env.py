@@ -1,4 +1,5 @@
-﻿import asyncio
+﻿import argparse
+import asyncio
 import websockets
 import json
 import os
@@ -54,6 +55,52 @@ MAX_EPISODE_STEPS = int(os.environ.get('LF2_MAX_STEPS', '3000'))
 # 难度下标 → 名字，只为打印。数值来自 manager.js 的 diff_list，
 # 对手 AI 由 URL 的 ?debug&diff=0/1/2 决定（0 是 dumbass，2 是 Crusher）。
 DIFF_NAMES = {0: 'Easy', 1: 'Normal', 2: 'Difficult'}
+# 难度名 → URL 里的 diff 下标（与 manager.js 的 difficulty_index 一一对应）
+DIFF_LEVELS = {'easy': 0, 'normal': 1, 'difficult': 2}
+# 切换难度后，等新页面报出目标难度的时长。页面重载要重新加载素材，和 FRESH_TIMEOUT 同量级。
+DIFF_TIMEOUT = 30.0
+# 切换尝试次数。全都失败就报错 —— 绝不带着错误的难度继续训练。
+DIFF_ATTEMPTS = 3
+
+
+def resolve_diff(value):
+    """把 --diff 的取值统一成 0/1/2。
+
+    None 表示「不干预」：完全沿用页面 URL 里的设置（旧行为），返回 None。
+    接受 'easy'/'normal'/'difficult'（大小写、首尾空格都容忍），
+    也接受 0/1/2 以及命令行传进来的 '0'/'1'/'2'。
+    非法值直接抛 ValueError —— 在绑定 8765 之前就失败，别等浏览器连上来才发现。
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        key = value.strip().lower()
+        if key in DIFF_LEVELS:
+            return DIFF_LEVELS[key]
+        if key in ('0', '1', '2'):
+            return int(key)
+    elif isinstance(value, int) and not isinstance(value, bool):
+        if value in DIFF_NAMES:
+            return value
+    raise ValueError(
+        f"未知难度：{value!r}（可用 easy / normal / difficult，或 0 / 1 / 2）"
+    )
+
+
+def diff_arg(value):
+    """argparse 的 type：`--diff` 同时接受名字和 0/1/2，统一返回小写难度名。
+
+    返回名字而不是数字，是为了让入口脚本里已有的打印、TensorBoard 的
+    `diff_name`、argparse 的 choices 校验都继续按字符串走。
+    非法值抛 ArgumentTypeError，argparse 会原样打印中文提示。
+    """
+    try:
+        level = resolve_diff(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e))
+    if level is None:
+        raise argparse.ArgumentTypeError("不能为空")
+    return DIFF_NAMES[level].lower()
 
 
 def state_to_obs(state):
@@ -79,8 +126,15 @@ def state_to_obs(state):
 
 
 class LF2Env(gym.Env):
-    def __init__(self):
+    def __init__(self, diff=None):
         super().__init__()
+        # 本次运行要求的难度；None = 完全沿用页面 URL 的设置（旧行为）。
+        # 放在 _start_server() 之前：非法的 diff 在占端口之前就抛错。
+        self.diff = resolve_diff(diff)
+        self.diff_name = DIFF_NAMES.get(self.diff)
+        # 最近一局实际观察到的难度/对手，供 eval.py 的 JSON 汇总引用
+        self.observed_difficulty = None
+        self.observed_ai = None
         self.observation_space = spaces.Box(
             low=-2.0, high=2.0, shape=(13,), dtype=np.float32
         )
@@ -97,6 +151,9 @@ class LF2Env(gym.Env):
         self._rejected_sessions = set()
         # 上一次打印过的对手 AI 名字，用来在难度变化时提醒一次
         self._announced_ai = None
+        if self.diff is not None:
+            print(f"[难度] 本次运行要求 {self.diff_name}（diff={self.diff}），"
+                  f"连上页面后会自动切换并校验")
         self._start_server()
 
     def _start_server(self):
@@ -150,9 +207,16 @@ class LF2Env(gym.Env):
         keys = ACTION_KEYS[action]
         self._send_raw({"action": int(action), "keys": keys})
 
-    def _request_reload(self):
-        """请浏览器刷新页面、重开一局（JS 侧收到 {"cmd":"reload"} 后 location.reload）。"""
-        return self._send_raw({"cmd": "reload"})
+    def _request_reload(self, diff=None):
+        """请浏览器刷新页面、重开一局；带 diff 时顺带把页面 URL 的难度改掉。
+
+        diff 缺省取 self.diff，所以 _ensure_fresh / step 里现有的调用点都不用改，
+        难度会自动跨局保留。self.diff is None 时发出去的内容和以前逐字一致。
+        """
+        diff = self.diff if diff is None else diff
+        if diff is None:
+            return self._send_raw({"cmd": "reload"})
+        return self._send_raw({"cmd": "reload", "diff": int(diff)})
 
     def _state_to_obs(self, state):
         # 具体实现在模块级 state_to_obs()，这里只做委托，语义和以前完全一致
@@ -230,6 +294,71 @@ class LF2Env(gym.Env):
             time.sleep(0.01)
         return False
 
+    def _wait_difficulty(self, timeout):
+        """等一帧 difficulty == self.diff 的状态；返回该帧或 None。"""
+        start = time.time()
+        while time.time() - start < timeout:
+            with self._lock:
+                s = self.latest_state
+            if s is not None and s.get('difficulty') == self.diff:
+                return s
+            time.sleep(0.01)
+        return None
+
+    def _apply_difficulty(self):
+        """把已经开着的浏览器切到 self.diff，并确认页面真的报出了这个难度。
+
+        self.diff is None 时是零成本的 no-op。切换靠 match.js 收到
+        {"cmd":"reload","diff":N} 后改写 URL 再导航，重载会换一个新的
+        rl_session_id —— 这正是 _ensure_fresh 认的“新局”，所以切换完可以直接开局。
+        """
+        if self.diff is None:
+            return
+        with self._lock:
+            s = self.latest_state
+        if s is not None and s.get('difficulty') == self.diff:
+            return                      # 已经是目标难度：不重载，零延迟
+
+        for attempt in range(1, DIFF_ATTEMPTS + 1):
+            with self._lock:
+                s = self.latest_state
+            if s is not None and s.get('difficulty') == self.diff:
+                return                  # 上一轮重载生效得慢，这里补认一次
+            seen = None if s is None else s.get('difficulty')
+            print(f"[难度] 当前 diff={seen}，切换到 {self.diff_name}"
+                  f"（diff={self.diff}），第 {attempt}/{DIFF_ATTEMPTS} 次...")
+            # 和 _ensure_fresh 第 3 步同样的处理：旧 session 永久否决。
+            # 否则首次 reset 时 _is_new_round 的 `_session_in_use is None` 分支
+            # 可能因为新页面已经跑过 FRESH_MATCH_TIME 而拒收，导致白重载一次。
+            if s and s.get('session'):
+                self._rejected_sessions.add(s['session'])
+            with self._lock:
+                self.latest_state = None
+            if not self._request_reload(self.diff):
+                # ws 正好在重连：给连接一点时间，下一轮再发
+                self._wait_for_state(5.0)
+                continue
+            confirmed = self._wait_difficulty(DIFF_TIMEOUT)
+            if confirmed is not None:
+                print(f"[难度] 已确认 {self.diff_name}"
+                      f"（对手 AI：{confirmed.get('ai')}）")
+                return
+            with self._lock:
+                s = self.latest_state
+            print(f"[难度] {DIFF_TIMEOUT:.0f} 秒内没切换成功"
+                  f"（此刻 difficulty={None if s is None else s.get('difficulty')}）")
+
+        raise RuntimeError(
+            f"无法把游戏切换到 {self.diff_name}（diff={self.diff}）："
+            f"页面上报的 difficulty 一直不是 {self.diff}。请检查：\n"
+            f"  1) 游戏页面是否带 ?debug（只有 debug 模式才会开局并发送状态，"
+            f"主菜单 / ?demo 永远不会报出 difficulty）；\n"
+            f"  2) 是否用 serve.py 提供页面（它发 no-store，重载能拿到最新的 "
+            f"LF/match.js；旧缓存的 match.js 不认识 reload 消息里的 diff 字段）；\n"
+            f"  3) 是否有另一个标签页同时在改难度。\n"
+            f"  仍不行就重开 launch_browser.py 后再跑。"
+        )
+
     def _ensure_fresh(self):
         """保证接下来的一局是从 t≈0 开始的干净一局。"""
         # 1) 等浏览器连上并真的在发状态
@@ -239,10 +368,12 @@ class LF2Env(gym.Env):
         silent_reloads = 0
         while not self._wait_for_state(5.0):
             if time.time() > deadline:
-                raise TimeoutError(
-                    "等待游戏状态超时：浏览器没有连上 ws://localhost:8765，"
-                    "或页面打开后一直没有开始比赛。请确认游戏页面已打开、没有卡死。"
-                )
+                msg = ("等待游戏状态超时：浏览器没有连上 ws://localhost:8765，"
+                       "或页面打开后一直没有开始比赛。请确认游戏页面已打开、没有卡死。")
+                if self.diff is not None:
+                    msg += (f"\n另外：本次要求 {self.diff_name}，"
+                            f"游戏页面必须带 ?debug 才会开局并发送状态。")
+                raise TimeoutError(msg)
             # 只在“已经连上”时累计沉默时间：还没连上属于浏览器没开，重载也没用
             if self.ws is not None:
                 silent += 5.0
@@ -252,10 +383,13 @@ class LF2Env(gym.Env):
                 self._request_reload()
                 silent = 0.0
                 silent_reloads += 1
-        # 2) 如果当前已经是新局，直接用
+        # 2) 把难度切到 --diff 要求的值（没指定时是 no-op）。
+        #    必须在“认领新局”之前，否则会先接受一局错误难度的对局。
+        self._apply_difficulty()
+        # 3) 如果当前已经是新局，直接用
         if self._wait_new_round(GRACE_TIME):
             return
-        # 3) 否则主动请页面重开（最多 4 次）
+        # 4) 否则主动请页面重开（最多 4 次）
         for attempt in range(4):
             with self._lock:
                 s = self.latest_state
@@ -292,6 +426,14 @@ class LF2Env(gym.Env):
             state = self.latest_state
             obs = self._state_to_obs(state)
             self._session_in_use = state.get('session', self._session_in_use)
+        self.observed_difficulty = state.get('difficulty')
+        self.observed_ai = state.get('ai')
+        # 最后一道闸：_apply_difficulty 之后如果又发生重载/人工干预，这里也不会放过
+        if self.diff is not None and self.observed_difficulty != self.diff:
+            raise RuntimeError(
+                f"难度校验失败：要求 diff={self.diff}（{self.diff_name}），"
+                f"页面报告 {self.observed_difficulty}（对手 AI：{self.observed_ai}）。"
+                f"拒绝在这个难度下继续训练/评估。")
         # 难度/对手换过就报一次：跑几小时之后，日志里必须能看出这条曲线是在打谁
         ai = state.get('ai')
         if ai and ai != self._announced_ai:

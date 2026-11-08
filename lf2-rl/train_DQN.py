@@ -40,7 +40,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from env import LF2Env
+from env import DIFF_NAMES, LF2Env, diff_arg, resolve_diff
 from rl_metrics import (
     ATTACK_ACTIONS, RANDOM_ATTACK_RATE,
     action_entropy, action_name, dist_px, hp_from_obs, is_attack, wilson,
@@ -441,7 +441,8 @@ def load_checkpoint(path, device='cpu'):
     raise ValueError(f'{path} 不是可识别的 checkpoint（既不是训练存档也不是裸 state_dict）')
 
 
-def config_dict(run_name):
+def config_dict(run_name, diff=None):
+    level = resolve_diff(diff)
     return {
         'obs_dim': OBS_DIM, 'act_dim': ACT_DIM, 'gamma': GAMMA, 'lr': LR,
         'batch_size': BATCH_SIZE, 'buffer_size': BUFFER_SIZE,
@@ -450,6 +451,9 @@ def config_dict(run_name):
         'epsilon_decay': EPSILON_DECAY, 'episodes': EPISODES,
         'eval_every': EVAL_EVERY, 'eval_episodes': EVAL_EPISODES,
         'ckpt_every': CKPT_EVERY, 'log_window': LOG_WINDOW,
+        # 本次要求的难度（None = 沿用页面 URL）。写进 TensorBoard 和 checkpoint，
+        # 以后看曲线/续训时才知道这条胜率是在打谁。
+        'diff': level, 'diff_name': DIFF_NAMES.get(level),
         'run_name': run_name, 'torch_version': torch.__version__,
     }
 
@@ -459,7 +463,7 @@ def config_dict(run_name):
 # =====================================================
 def train(resume=None, episodes=None, eval_every=None, eval_episodes=None,
           ckpt_every=None, log_dir=None, device=None, new_run=False,
-          run_name=None):
+          run_name=None, diff=None):
     """训练主循环。
 
     参数为 None 时一律回落到模块级常量（环境变量已经处理过一遍）。
@@ -499,17 +503,22 @@ def train(resume=None, episodes=None, eval_every=None, eval_episodes=None,
         explicit_name = (ckpt or {}).get('run_name')
     run_name, run_dir = resolve_run_dir(log_dir, run_name=explicit_name)
     writer = make_writer(run_dir, enabled=TB_ENABLED)
-    cfg = config_dict(run_name)
+    cfg = config_dict(run_name, diff)
 
     print(f'[日志] {run_dir or "（TensorBoard 已关闭）"}    [局数] {episodes}    '
           f'[评估] 每 {eval_every} 局跑 {eval_episodes} 局')
+    if cfg['diff'] is not None:
+        print(f'[难度] 请求 {cfg["diff_name"]}（diff={cfg["diff"]}）；'
+              f'env.py 会切换并校验，切不过去会直接报错。')
+    else:
+        print('[难度] 未指定 --diff，沿用页面 URL 里的难度（旧行为）。')
     if run_dir:
         print(f'        tensorboard --logdir {log_dir}')
     writer.add_text('meta/config_json', json.dumps(cfg, ensure_ascii=False), 0)
     writer.add_scalar('train/learning_rate', LR, 0)
 
     # ---- 2. 建立環境（會等瀏覽器連接）----
-    env = LF2Env()
+    env = LF2Env(diff=diff)
 
     # ---- 3. 建立網路 ----
     q_net      = QNetwork(OBS_DIM, ACT_DIM).to(device)
@@ -524,6 +533,14 @@ def train(resume=None, episodes=None, eval_every=None, eval_episodes=None,
     history         = []   # 每轮评估一条
 
     if ckpt is not None:
+        # 续训时难度库不一致要提醒：不同难度的胜率不能直接对比。
+        # 旧 checkpoint 没有 diff 这个键，取到 None 就不报警。
+        prev_diff = (ckpt.get('config') or {}).get('diff')
+        new_diff = cfg['diff']
+        if prev_diff is not None and new_diff is not None and prev_diff != new_diff:
+            print(f'[警告] 这个 checkpoint 是在 diff={prev_diff}'
+                  f'（{DIFF_NAMES.get(prev_diff, "?")}）下训练的，本次要求 diff={new_diff}'
+                  f'（{DIFF_NAMES.get(new_diff, "?")}）。两边的胜率不能直接对比。')
         q_net.load_state_dict(ckpt['model'])
         if ckpt.get('target') is not None:
             target_net.load_state_dict(ckpt['target'])
@@ -829,6 +846,11 @@ def main(argv=None):
     p.add_argument('--new-run', action='store_true',
                    help='续训时强制开新的 logs/DQN_N（默认接回原来的目录，曲线连续）')
     p.add_argument('--no-tb', action='store_true', help='不写 TensorBoard')
+    p.add_argument('--diff', type=diff_arg, choices=('easy', 'normal', 'difficult'),
+                   default=None,
+                   help='对手难度，可写 easy / normal / difficult 或 0 / 1 / 2；'
+                        '不给则沿用页面 URL 里的设置（旧行为）。'
+                        '指定后 env.py 会切换已打开的浏览器并校验。')
     p.add_argument('--device', default=None, choices=('cpu', 'cuda'))
     args = p.parse_args(argv)
 
@@ -842,7 +864,8 @@ def main(argv=None):
 
     train(resume=resume, episodes=args.episodes, eval_every=args.eval_every,
           eval_episodes=args.eval_episodes, ckpt_every=args.ckpt_every,
-          log_dir=log_dir, device=args.device, new_run=args.new_run)
+          log_dir=log_dir, device=args.device, new_run=args.new_run,
+          diff=args.diff)
 
 
 if __name__ == '__main__':

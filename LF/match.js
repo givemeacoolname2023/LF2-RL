@@ -12,6 +12,24 @@ var rl_reloading = false;  // 防止重复 reload
 // Headless mode: ?headless 参数跳过 canvas 渲染，大幅提速
 var rl_headless = (window.location.search.indexOf('headless') !== -1);
 
+// 把页面 URL 里的难度换成 level（0/1/2），用来响应 env.py 的切换难度请求。
+// 只改 diff=N 这一个 token：不能用 URLSearchParams，因为它会输出 debug= / headless=，
+// 而 manager.js:254 的 `else if (param.debug)` 靠真值判断，空串会让页面退回主菜单，
+// 训练端就再也收不到状态了。
+function rl_url_with_diff(level) {
+  var href = window.location.href
+  var hashAt = href.indexOf('#')
+  var hash = hashAt >= 0 ? href.slice(hashAt) : ''
+  var base = hashAt >= 0 ? href.slice(0, hashAt) : href
+  var re = /([?&])diff(?:=[^&]*)?(?=&|$)/g
+  if (re.test(base)) {
+    base = base.replace(re, '$1diff=' + level)
+  } else {
+    base += (base.indexOf('?') >= 0 ? '&' : '?') + 'diff=' + level
+  }
+  return base + hash
+}
+
 var ACTION_MAP = [
   [],                        // 0: 不动
   ['left'],                  // 1: 左
@@ -60,7 +78,17 @@ function rl_inject_action(action) {
       try { msg = JSON.parse(e.data); } catch (err) { return; }
       // 后端要求重开一局（回合结束/超时/页面停在主菜单时由 env.py 主动请求）
       if (msg.cmd === 'reload') {
-        window.location.reload();
+        // 带 diff 时顺带切换难度：改写 URL 再导航，新页面 start_debug() 会读
+        // param.diff 选出对应的对手 AI。不带 diff 时行为与原来完全一致。
+        var level = (msg.diff === undefined || msg.diff === null)
+          ? NaN : parseInt(msg.diff, 10)
+        if (level === 0 || level === 1 || level === 2) {
+          var target = rl_url_with_diff(level)
+          console.log('[RL] 切换难度 diff=' + level + ' -> ' + target)
+          window.location.replace(target);   // 不留 history，效果等同一次 reload
+        } else {
+          window.location.reload();
+        }
         return;
       }
       rl_action = msg.action || 0;

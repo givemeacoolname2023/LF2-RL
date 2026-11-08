@@ -40,7 +40,8 @@ from collections import Counter
 import numpy as np
 import torch
 
-from env import ACTION_KEYS, LF2Env, OBS_SCALE
+from env import (ACTION_KEYS, DIFF_NAMES, LF2Env, OBS_SCALE,
+                 diff_arg, resolve_diff)
 
 # 观测下标 / 出招判定 / Wilson CI 统一定义在 rl_metrics.py，
 # 因为 train_DQN.py 的 evaluate() 也要用同一套口径，两边不能各写一份。
@@ -231,6 +232,12 @@ def main():
                              'DQN 没有可采样的分布，用 softmax(Q/温度) 代替。')
     parser.add_argument('--temperature', type=float, default=1.0,
                         help='仅 DQN 的 --stochastic 用：softmax(Q/T) 的温度（默认 1.0）')
+    parser.add_argument('--diff', type=diff_arg,
+                        choices=('easy', 'normal', 'difficult'), default=None,
+                        help='对手难度，可写 easy / normal / difficult 或 0 / 1 / 2；'
+                             '不给则沿用页面 URL 里的设置（旧行为）。'
+                             '指定后 env.py 会切换已打开的浏览器并校验，'
+                             '切不过去会直接报错，绝不评估错难度的对手。')
     parser.add_argument('--json', default=None, metavar='PATH',
                         help='把汇总结果另存为 JSON（写报告时引用）')
     args = parser.parse_args()
@@ -267,12 +274,19 @@ def main():
 
     print(f'[模型] {model_path}    [算法] {algo.upper()}')
     print(f'[局数] {args.episodes}    [设备] {args.device}')
+    if args.diff:
+        diff_level = resolve_diff(args.diff)
+        diff_msg = (f'请求 {DIFF_NAMES[diff_level]}（diff={diff_level}），'
+                    f'env.py 会切换并校验')
+    else:
+        diff_msg = '未指定 --diff，沿用页面 URL 里的设置'
+    print(f'[难度] {diff_msg}')
     print(f'[提示] 需要 serve.py + 浏览器页面已打开；一局约 45~65 秒。')
     print()
 
     # ---- 3. 建环境和模型（只能建一个 LF2Env，8765 写死了）----
     try:
-        env = LF2Env()
+        env = LF2Env(diff=args.diff)
     except Exception as e:
         print(f'[错误] 创建环境失败：{e}')
         return 1
@@ -299,8 +313,8 @@ def main():
         for ep in range(1, args.episodes + 1):
             try:
                 obs, _ = env.reset()
-            except TimeoutError as e:
-                print(f'[错误] 等不到游戏状态：{e}')
+            except (TimeoutError, RuntimeError) as e:
+                print(f'[错误] 游戏环境不可用：{e}')
                 print('       检查 launch_browser.py 的页面是否还开着、是否被最小化冻结。')
                 break
 
@@ -432,6 +446,11 @@ def main():
             'distinct_len': n_distinct, 'elapsed_secs': round(elapsed, 1),
             'action_counts': {action_name(a): c for a, c in action_counter.most_common()},
             'checkpoint_meta': meta,
+            # 难度自证：写报告时不用再猜这次是在打谁
+            'difficulty_requested': args.diff,
+            'difficulty_index': env.diff,
+            'difficulty_observed': env.observed_difficulty,
+            'ai_observed': env.observed_ai,
         }
         try:
             with open(args.json, 'w', encoding='utf-8') as f:

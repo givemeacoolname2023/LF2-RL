@@ -128,6 +128,18 @@ dodges). `launch_browser.py --diff easy|normal|difficult` writes the parameter f
 The chosen opponent is announced once per run in the training/eval console
 (`[难度] Easy（对手 AI：dumbass）`) and travels in the WebSocket state payload.
 
+`--diff` is also accepted by `train.py`, `train_DQN.py` and `eval.py`. When given,
+`env.py` switches the **already-open** page over the existing WebSocket (it rewrites
+the URL's `diff=N` and forces a reload) and verifies `state['difficulty']` before the
+first episode. If the page never reports that difficulty, the run raises instead of
+silently training against the wrong opponent. This means changing difficulty is just
+Ctrl+C and rerun with another flag — the browser does not have to be restarted.
+Without `--diff`, nothing changes: the page's own setting is used.
+
+`--diff` accepts either the names or the numeric index (`--diff difficult` and
+`--diff 2` are the same thing; likewise `0` = Easy, `1` = Normal), in the entry
+scripts as well as in `launch_browser.py`.
+
 **5. Run training**
 ```bash
 cd lf2-rl
@@ -137,6 +149,10 @@ python train.py
 
 # Phase 3: Double DQN (recommended)
 python train_DQN.py
+
+# Pin the opponent difficulty for this run (no need to relaunch the browser)
+python train.py --diff normal
+python train_DQN.py --diff difficult
 ```
 
 The script waits for the browser to connect, then starts training automatically.
@@ -153,6 +169,9 @@ tensorboard --logdir logs
 python eval.py --algo ppo --model checkpoints/best_model.zip   # best greedy win rate
 python eval.py --model lf2_ppo.zip                             # merely the last one
 python eval.py --algo dqn --model checkpoints/best_model.pt --episodes 100 --json out.json
+
+# Evaluate against a specific difficulty; the JSON records what was actually fought
+python eval.py --diff difficult --episodes 20 --json out.json
 
 # Resume a DQN run from where it stopped (Ctrl+C now saves interrupted.pt first)
 python train_DQN.py --resume
@@ -208,6 +227,7 @@ Special moves are packed as single atomic actions — no key-sequence learning r
 ---
 
 ## Acknowledgements
+This project builds on LF2-RL by ChristinaPuth.
 
 This project builds on [F.LF](https://github.com/Project-F/F.LF) by Project-F, which provides the HTML5 game engine, character sprites, and physics. We modified `match.js` to broadcast game state over WebSocket and added the entire `lf2-rl/` directory for RL training.
 

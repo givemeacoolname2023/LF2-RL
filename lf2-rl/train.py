@@ -16,18 +16,20 @@
 所以这些都留成模块级全局，`main()` 里按名字查表取，不要在函数内重新算。
 """
 
+import argparse
 import csv
 import os
 import time
 
 import numpy as np
 
-from env import LF2Env
+from env import DIFF_NAMES, LF2Env, diff_arg, resolve_diff
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
+# 1200_000大概8小时
 # 训练总步数，可用环境变量覆盖（冒烟测试：LF2_TIMESTEPS=2048 python train.py）
-TOTAL_TIMESTEPS = int(os.environ.get("LF2_TIMESTEPS", "1200_000"))
+TOTAL_TIMESTEPS = int(os.environ.get("LF2_TIMESTEPS", "300_000"))
 # 页面服务端口：只用于打印提示，本脚本本身不监听它（训练用的是 ws 8765，写死在 env.py 里）
 HTTP_PORT = os.environ.get("LF2_PORT", "8000")
 # 每多少步存一个 checkpoint（可用 LF2_CKPT_FREQ 覆盖）。40fps 下 20000 步≈8 分钟：
@@ -201,9 +203,12 @@ class BestModelCallback(BaseCallback):
             writer.writerow(row)
 
 
-def main():
+def main(diff=None):
     print("初始化环境...")
-    env = LF2Env()
+    # 难度在本地先解析一遍：冒烟测试会把 LF2Env 换成没有 .diff 的假环境，
+    # 打印不能依赖 env 实例上的属性。
+    level = resolve_diff(diff)
+    env = LF2Env(diff=diff)
 
     print("请先启动静态服务和浏览器（两个终端，端口要一致）：")
     print(f"  python serve.py --port {HTTP_PORT}")
@@ -211,6 +216,11 @@ def main():
     print("或者手动打开页面，地址为：")
     print(f"  http://localhost:{HTTP_PORT}/LF2-RL/game/game.html?debug&headless")
     print("（8000 被占用时：set LF2_PORT=8010 再跑本脚本；ws 桥固定 8765，不用管）")
+    if level is not None:
+        print(f"[难度] 请求 {DIFF_NAMES[level]}（diff={level}）；"
+              f"env.py 会切换已打开的浏览器并校验，切不过去会直接报错。")
+    else:
+        print("[难度] 未指定 --diff，沿用页面 URL 里的难度（旧行为）。")
     print("等待连接...")
 
     model = PPO(
@@ -257,5 +267,24 @@ def main():
     return model, best_cb
 
 
+def _parse_args(argv=None):
+    """只解析 --diff。
+
+    刻意不在 main() 里解析：smoke_ppo_best.py 直接无参调用 train.main()，
+    若 main() 自己读 sys.argv，冒烟测试就会被它自己的参数搞挂。
+    """
+    parser = argparse.ArgumentParser(description="PPO 训练（Stable-Baselines3）")
+    parser.add_argument(
+        "--diff",
+        type=diff_arg,
+        choices=("easy", "normal", "difficult"),
+        default=None,
+        help="对手难度，可写 easy / normal / difficult 或 0 / 1 / 2；"
+             "不给则沿用页面 URL 里的设置（旧行为）。"
+             "指定后 env.py 会切换已打开的浏览器并校验。",
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
-    main()
+    main(diff=_parse_args().diff)
