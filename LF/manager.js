@@ -1516,10 +1516,28 @@ define(['LF/global', 'LF/network', 'LF/soundpack', 'LF/match', 'LF/util', 'LF/to
         })
       }
 
+      // 难度 → 对手 AI 在 AI_list 里的下标。
+      // 注意 options.difficulty 只是个菜单标签：start_match() 只读 background，
+      // match.create() 也没有 options 这个键，引擎从不把 difficulty 传给对局。
+      // 真正决定 AI 强弱的是这里选了哪个脚本（顺序见 LF2_19/data/data.js 的 AI 列表）。
+      const DIFF_TO_AI = [2, 1, 0]   // 0 Easy→dumbass, 1 Normal→Challangar, 2 Difficult→Crusher
+
+      // URL 参数 diff=0/1/2；缺省或非法一律按 Easy —— 训练和评估都走 ?debug 这个入口
+      const difficulty_index = function () {
+        const raw = parseInt(param.diff, 10)
+        return (raw === 0 || raw === 1 || raw === 2) ? raw : 0
+      }
+
       // p2_type 只影响 Dennis 的 type：
       //   start_debug()        → 'computer'，训练和评估走这条（行为必须保持不变）
       //   start_debug('human') → 人是 Dennis、模型是 Davis，用于 ?pve 真人对打
       this.start_debug = function (p2_type) {
+        const diff = difficulty_index()
+        const ai_index = DIFF_TO_AI[diff]
+        // 交给 match.js 一起推进每帧状态，Python 侧才能把难度写进训练日志
+        window.rl_difficulty = diff
+        window.rl_ai_name = AI_list[ai_index].name
+        console.log(`[RL] 难度 ${diff_list[diff]} → 对手 AI: ${AI_list[ai_index].name}`)
         const match = this.start_match({
           players: [
             {
@@ -1535,13 +1553,13 @@ define(['LF/global', 'LF/network', 'LF/soundpack', 'LF/match', 'LF/util', 'LF/to
               name: 'Dennis',
               type: p2_type || 'computer',
               selected: 8,
-              selected_AI: 0,
+              selected_AI: ai_index,
               team: 2
             }
           ],
           options: {
             background: -1,
-            difficulty: 2
+            difficulty: diff
           }
         })
       }

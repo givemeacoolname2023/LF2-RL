@@ -21,6 +21,7 @@ launch_browser.py —— 用一个不会被浏览器“冻结”的方式打开 
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -100,6 +101,12 @@ def main():
         help="游戏页面路径（相对于 HTTP 服务的根目录）",
     )
     parser.add_argument(
+        "--diff",
+        choices=("easy", "normal", "difficult"),
+        default=None,
+        help="对手难度，写进 URL 的 diff=0/1/2（不给就用页面默认的 easy）",
+    )
+    parser.add_argument(
         "--visible",
         action="store_true",
         help="显示窗口（仍会禁用后台节流），默认是无头",
@@ -116,6 +123,14 @@ def main():
         help="独立的浏览器用户目录，避免和日常使用的 Chrome 冲突",
     )
     args = parser.parse_args()
+
+    # 难度：把 --path 里可能已经写过的 diff=N 换掉（而不是简单删掉再拼，
+    # 那样 `?diff=2&debug` 会变成 `&debug?diff=0`，把 debug 也弄丢）
+    if args.diff:
+        level = {"easy": 0, "normal": 1, "difficult": 2}[args.diff]
+        base, _, query = args.path.partition("?")
+        kept = [p for p in query.split("&") if p and not re.match(r"diff=\d+$", p)]
+        args.path = base + "?" + "&".join(kept + [f"diff={level}"])
 
     url = f"http://{args.host}:{args.port}{args.path}"
     browser = find_browser(args.browser)

@@ -114,9 +114,19 @@ Query parameter cheatsheet:
 | URL | What you get |
 |---|---|
 | `game/game.html` | normal F.LF main menu — pick characters, stage and difficulty yourself |
-| `game/game.html?debug` | skips the menu, jumps straight into Davis vs Dennis (the training matchup) |
+| `game/game.html?debug` | skips the menu, jumps straight into Davis vs Dennis (**Easy** opponent by default) |
+| `game/game.html?debug&diff=1` | same, Normal opponent (`CHALLANGAR`) |
+| `game/game.html?debug&diff=2` | same, Difficult opponent (`CRUSHER`) — the setup every pre-2026 number was measured on |
 | `game/game.html?demo` | built-in AI vs AI demo, `Esc` to leave |
 | `game/game.html?debug&headless` | training / unattended (no rendering) |
+
+**Difficulty is implemented by swapping the opponent AI script, not by the engine's
+`options.difficulty`** — that field is only used to render a menu label and is never
+handed to the match. `diff=0` loads `dumbass` (108 lines, walks up and punches, no
+specials), `diff=1` loads `Challangar`, `diff=2` loads `Crusher` (614 lines, combos and
+dodges). `launch_browser.py --diff easy|normal|difficult` writes the parameter for you.
+The chosen opponent is announced once per run in the training/eval console
+(`[难度] Easy（对手 AI：dumbass）`) and travels in the WebSocket state payload.
 
 **5. Run training**
 ```bash

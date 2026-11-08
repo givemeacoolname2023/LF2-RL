@@ -431,6 +431,9 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
       return {
         session: rl_session_id,
         time: $.time.t,
+        // 由 manager.js 的 start_debug 写进 window，用来让训练/评估日志能写明在打谁
+        difficulty: window.rl_difficulty,
+        ai: window.rl_ai_name,
         davis: {
           x: davis.ps.x, y: davis.ps.y,
           hp: davis.health.hp, mp: davis.health.mp,

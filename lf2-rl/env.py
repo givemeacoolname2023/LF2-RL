@@ -51,6 +51,9 @@ FRESH_TIMEOUT = 30.0
 # 的僵局让一局无限长（match.js 里那句 MAX_STEPS 注释指的就是它）。
 # 按 45 帧/秒算，3000 帧约 66 秒；可用环境变量 LF2_MAX_STEPS 覆盖。
 MAX_EPISODE_STEPS = int(os.environ.get('LF2_MAX_STEPS', '3000'))
+# 难度下标 → 名字，只为打印。数值来自 manager.js 的 diff_list，
+# 对手 AI 由 URL 的 ?debug&diff=0/1/2 决定（0 是 dumbass，2 是 Crusher）。
+DIFF_NAMES = {0: 'Easy', 1: 'Normal', 2: 'Difficult'}
 
 
 def state_to_obs(state):
@@ -92,6 +95,8 @@ class LF2Env(gym.Env):
         self._session_in_use = None
         # 已经确认“不是新开局”的 session，同一个 session 不会再被当成新局
         self._rejected_sessions = set()
+        # 上一次打印过的对手 AI 名字，用来在难度变化时提醒一次
+        self._announced_ai = None
         self._start_server()
 
     def _start_server(self):
@@ -287,6 +292,11 @@ class LF2Env(gym.Env):
             state = self.latest_state
             obs = self._state_to_obs(state)
             self._session_in_use = state.get('session', self._session_in_use)
+        # 难度/对手换过就报一次：跑几小时之后，日志里必须能看出这条曲线是在打谁
+        ai = state.get('ai')
+        if ai and ai != self._announced_ai:
+            self._announced_ai = ai
+            print(f"[难度] {DIFF_NAMES.get(state.get('difficulty'), '?')}（对手 AI：{ai}）")
         print(f"[Reset] 已连接，开始第 {self._episode} 局（t={state['time']}）")
         return obs, {}
 

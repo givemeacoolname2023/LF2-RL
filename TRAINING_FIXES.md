@@ -700,14 +700,30 @@ python launch_browser.py --port 8010 --visible --path "/LF2-RL/game/game.html?de
 ```
 
 `?debug` 的作用就是**跳过菜单直接开局**（`manager.js:250` → `start_debug()`，
-固定 Davis vs Dennis、难度 2），所以带 `?debug` 时不会看到选人界面——这是设计如此，不是坏了。
+固定 Davis vs Dennis），所以带 `?debug` 时不会看到选人界面——这是设计如此，不是坏了。
+
+**难度是换对手 AI 脚本实现的，不是靠 `options.difficulty`。** 那个字段只用来渲染菜单文字，
+`start_match()` 根本不读它（只读 `background`），`match.create()` 也没有 `options` 键——
+所以以前在 `manager.js` 里看到 `difficulty: 2` 就以为在打"难度 2"，其实一直没有生效，
+真正在打的是 `AI_list[0]` = Crusher。现在由 URL 的 `diff=` 选脚本：
+
+| `diff` | 难度 | 对手 AI | 规模 |
+|---|---|---|---|
+| 缺省 / `0` | Easy | `dumbass` | 108 行，只会追着扇巴掌，不出特技 |
+| `1` | Normal | `CHALLANGAR 1.0` | 200 行 |
+| `2` | Difficult | `CRUSHER 1.0` | 614 行，连招+闪避（**所有历史数字都是这个**） |
 
 | 想做的事 | `--path` |
 |---|---|
 | 正常玩，自己选人和场景 | `/LF2-RL/game/game.html` |
-| 直接打训练同款对局 | `/LF2-RL/game/game.html?debug` |
+| 直接打训练同款对局（Easy） | `/LF2-RL/game/game.html?debug` |
+| 打 Difficult（复现旧结果） | `/LF2-RL/game/game.html?debug&diff=2` |
 | 看内置 AI 互打 | `/LF2-RL/game/game.html?demo`（按 `Esc` 退出） |
 | 训练 / 无人值守 | `/LF2-RL/game/game.html?debug&headless`（默认值） |
+
+不想手写 query string 就用 `launch_browser.py --diff easy|normal|difficult`。
+跑起来之后，`train.py` / `train_DQN.py` / `eval.py` 的终端里会打印一次
+`[难度] Easy（对手 AI：dumbass）`——**看这一行就够了**，别靠记忆判断在打谁。
 
 键位（玩家 1，见 `LF/manager.js:121`；`Settings` 里可以改）：
 
