@@ -52,6 +52,22 @@ FRESH_TIMEOUT = 30.0
 # 的僵局让一局无限长（match.js 里那句 MAX_STEPS 注释指的就是它）。
 # 按 45 帧/秒算，3000 帧约 66 秒；可用环境变量 LF2_MAX_STEPS 覆盖。
 MAX_EPISODE_STEPS = int(os.environ.get('LF2_MAX_STEPS', '3000'))
+
+# ---------------------------------------------------------------------------
+# 奖励常数（完整推导和调参建议见项目根目录 reward.md）
+# ---------------------------------------------------------------------------
+# 必须与 train.py 里 PPO 的 gamma 一致：势函数塑形用的是 γΦ(s') - Φ(s)
+REWARD_GAMMA = 0.99
+# 势函数塑形的总权重。注意它乘的是“势差”，不是每帧固定给分
+SHAPING_SCALE = 0.5
+# 每点伤害的奖励 / 惩罚
+HIT_REWARD = 2.0          # 打中 Dennis
+HURT_PENALTY = 0.5        # 自己挨打（原 0.1，太便宜）
+STEP_PENALTY = 0.01       # 每帧小惩罚，鼓励尽快结束战斗
+# 胜负与超时
+WIN_BONUS = 200.0
+LOSS_PENALTY = 10.0
+TIMEOUT_PENALTY = 20.0    # 超时截断：比输更亏，杜绝拖时间
 # 难度下标 → 名字，只为打印。数值来自 manager.js 的 diff_list，
 # 对手 AI 由 URL 的 ?debug&diff=0/1/2 决定（0 是 dumbass，2 是 Crusher）。
 DIFF_NAMES = {0: 'Easy', 1: 'Normal', 2: 'Difficult'}
@@ -226,28 +242,37 @@ class LF2Env(gym.Env):
         if prev is None:
             return 0.0
 
+        # hp 差值：受伤为负；取负号得到“对对手造成的伤害”
         d_hp_delta = curr['davis']['hp'] - prev['davis']['hp']
         e_hp_delta = curr['dennis']['hp'] - prev['dennis']['hp']
         reward = 0.0
 
-        # 打中 Dennis 最重要
-        reward += (-e_hp_delta) * 2.0
+        # 打中 Dennis / 自己挨打
+        reward += (-e_hp_delta) * HIT_REWARD
+        reward += d_hp_delta * HURT_PENALTY      # d_hp_delta <= 0
 
-        # 被打惩罚小
-        reward += d_hp_delta * 0.1
+        # 距离：奖励“靠近的过程”，而不是“已经贴得近”。
+        # 势函数 Φ(s) = -min(|dx|, 300) / 300 ∈ [-1, 0]，塑形 = γΦ(s') - Φ(s)：
+        #   * 站着不动时只剩 (γ-1)Φ（每帧 ≤ +0.005），再减掉每帧惩罚后必为负，
+        #     所以贴脸不动、缩在角落都刷不到分；
+        #   * dx 截到 300，是为了让 Φ 有界 —— 否则 γ<1 时望远镜求和会留下
+        #     (γ-1)ΣΦ 的漂移，距离越远漂移越大，反而会奖励“躲到远处”。
+        #   * Φ 在整个 episode 上望远镜求和，总量只有 0.5 量级，
+        #     不会像旧版那样累积到上千、盖过伤害和胜负信号。
+        dx_prev = min(abs(prev['davis']['x'] - prev['dennis']['x']), 300.0)
+        dx_curr = min(abs(curr['davis']['x'] - curr['dennis']['x']), 300.0)
+        phi_prev = -dx_prev / 300.0
+        phi_curr = -dx_curr / 300.0
+        reward += SHAPING_SCALE * (REWARD_GAMMA * phi_curr - phi_prev)
+
+        # 每帧小惩罚，鼓励尽快结束战斗
+        reward -= STEP_PENALTY
 
         # 胜负
         if curr['dennis']['hp'] <= 0:
-            reward += 200.0
+            reward += WIN_BONUS
         if curr['davis']['hp'] <= 0:
-            reward -= 10.0
-
-        # 距离奖励：越近越好
-        dx = abs(curr['davis']['x'] - curr['dennis']['x'])
-        reward += max(0.0, (300.0 - dx) / 300.0) * 0.5
-
-        # 每帧小惩罚，鼓励尽快出手
-        reward -= 0.01
+            reward -= LOSS_PENALTY
 
         return reward
 
@@ -499,6 +524,7 @@ class LF2Env(gym.Env):
         truncated = (not terminated) and self._step_count >= MAX_EPISODE_STEPS
         if truncated:
             info['result'] = 'max_steps'
+            reward -= TIMEOUT_PENALTY
             print(f"[结果] ⏱ 到达步数上限 {MAX_EPISODE_STEPS}，截断本局")
 
         return obs, reward, terminated, truncated, info

@@ -29,7 +29,7 @@ from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
 # 1200_000大概8小时
 # 训练总步数，可用环境变量覆盖（冒烟测试：LF2_TIMESTEPS=2048 python train.py）
-TOTAL_TIMESTEPS = int(os.environ.get("LF2_TIMESTEPS", "300_000"))
+TOTAL_TIMESTEPS = int(os.environ.get("LF2_TIMESTEPS", "1200_000"))
 # 页面服务端口：只用于打印提示，本脚本本身不监听它（训练用的是 ws 8765，写死在 env.py 里）
 HTTP_PORT = os.environ.get("LF2_PORT", "8000")
 # 每多少步存一个 checkpoint（可用 LF2_CKPT_FREQ 覆盖）。40fps 下 20000 步≈8 分钟：
