@@ -35,13 +35,18 @@ var ACTION_MAP = [
   ['left'],                  // 1: 左
   ['right'],                 // 2: 右
   ['jump'],                  // 3: 跳
-  ['down'],                  // 4: 蹲
+  ['down'],                  // 4: 纵深向下（朝镜头），不是蹲
   ['att'],                   // 5: 攻击
   ['def'],                   // 6: 防御
   ['left', 'att'],           // 7: 左+攻击
   ['right', 'att'],          // 8: 右+攻击
   ['jump', 'att'],           // 9: 跳+攻击(Shoryuken方向)
-  ['down', 'att'],           // 10: 下+攻击
+  ['down', 'att'],           // 10: 下+攻击（combo 优先级下等同普通攻击）
+  ['up'],                    // 11: 纵深向上（远离镜头）。必须与 env.py 的 ACTION_KEYS 一致
+  ['left', 'down'],          // 12: 左+纵深向下（斜走；con.state 两个轴同时生效）
+  ['right', 'down'],         // 13: 右+纵深向下
+  ['left', 'up'],            // 14: 左+纵深向上
+  ['right', 'up'],           // 15: 右+纵深向上
 ];
 
 function rl_inject_action(action) {
@@ -463,12 +468,12 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
         difficulty: window.rl_difficulty,
         ai: window.rl_ai_name,
         davis: {
-          x: davis.ps.x, y: davis.ps.y,
+          x: davis.ps.x, y: davis.ps.y, z: davis.ps.z,
           hp: davis.health.hp, mp: davis.health.mp,
           frame: davis.frame.N, dir: davis.ps.dir
         },
         dennis: {
-          x: dennis.ps.x, y: dennis.ps.y,
+          x: dennis.ps.x, y: dennis.ps.y, z: dennis.ps.z,
           hp: dennis.health.hp, mp: dennis.health.mp,
           frame: dennis.frame.N, dir: dennis.ps.dir
         }

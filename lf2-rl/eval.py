@@ -4,10 +4,14 @@ eval.py —— 用训好的模型（PPO 或 DQN）打 N 局，统计胜率和行
 为什么需要它：
     train.py 只打 ep_rew_mean，而那个指标会被「距离奖励」灌水 ——
     模型站在中距离不动也能拿 400 多分，看起来"在学"，其实一招没出。
-    这个脚本直接数三件事：赢没赢、出没出招、站多远。这三个数骗不了人。
+    这个脚本直接数四件事：赢没赢、出没出招、站多远、纵深对不对齐。这几个数骗不了人。
 
-随机策略的对照基线：11 个动作里含 att 的有 5 个，所以随机出招占比 = 45.5%。
+随机策略的对照基线：动作里含 att 的有 5 个（总数随 ACTION_KEYS 变化），
+所以随机出招占比约三成（16 个动作时 5/16 ≈ 31%）。
 模型如果远低于这个数，说明它学的是「别打」，而不是「怎么打」。
+
+另外统计纵深：平均 |dz| 和「纵深对齐率」（|dz| <= 12px，即命中所需的 zwidth）。
+只对得上 x 对不上 z 的话，画面里看起来贴脸，实际一拳都打不中。
 
 用法（需要 serve.py + launch_browser.py 已启动，且 train.py 已停止 —— 8765 独占）：
     python eval.py                                      # 默认跑 checkpoints 里最新的模型，20 局
@@ -47,7 +51,7 @@ from env import (ACTION_KEYS, DIFF_NAMES, LF2Env, OBS_SCALE,
 # 因为 train_DQN.py 的 evaluate() 也要用同一套口径，两边不能各写一份。
 from rl_metrics import (        # noqa: F401 —— 这些名字仍然是 eval.py 的公开属性
     ATTACK_ACTIONS, IDX_D_HP, IDX_DX, IDX_E_HP,
-    RANDOM_ATTACK_RATE, action_name, wilson,
+    RANDOM_ATTACK_RATE, action_name, depth_aligned, dz_px, wilson,
 )
 
 WS_PORT = 8765
@@ -224,7 +228,7 @@ def main():
     parser.add_argument('--algo', choices=('auto', 'ppo', 'dqn'), default='auto',
                         help='ppo 读 .zip，dqn 读 .pt；auto 按扩展名判断（默认）')
     parser.add_argument('--episodes', type=int, default=20, help='跑几局（默认 20）')
-    parser.add_argument('--device', default='cpu', help='推理设备（默认 cpu，13 维 MLP 用不上 GPU）')
+    parser.add_argument('--device', default='cpu', help='推理设备（默认 cpu，16 维 MLP 用不上 GPU）')
     parser.add_argument('--stochastic', action='store_true',
                         help='按策略分布采样选动作，而不是取 argmax。'
                              '默认 deterministic：每局几乎一模一样，20 局约等于同一条轨迹跑 20 遍；'
@@ -322,8 +326,8 @@ def main():
             hp0_d = float(obs[IDX_D_HP]) * OBS_SCALE[IDX_D_HP]
             hp0_e = float(obs[IDX_E_HP]) * OBS_SCALE[IDX_E_HP]
 
-            steps = att = 0
-            dist_sum = 0.0
+            steps = att = aligned = 0
+            dist_sum = dz_sum = 0.0
             info = {}
             t_ep = time.time()
 
@@ -336,6 +340,8 @@ def main():
                 obs, reward, terminated, truncated, info = env.step(action)
                 steps += 1
                 dist_sum += abs(float(obs[IDX_DX]) * OBS_SCALE[IDX_DX])
+                dz_sum += dz_px(obs)
+                aligned += depth_aligned(obs)
 
                 if terminated or truncated:
                     break
@@ -350,6 +356,8 @@ def main():
                 'att': att,
                 'att_rate': att / steps if steps else 0.0,
                 'mean_dist': dist_sum / steps if steps else 0.0,
+                'mean_dz': dz_sum / steps if steps else 0.0,
+                'align_rate': aligned / steps if steps else 0.0,
                 'dealt': max(0.0, hp0_e - hp_e),
                 'taken': max(0.0, hp0_d - hp_d),
                 'secs': time.time() - t_ep,
@@ -361,6 +369,7 @@ def main():
             print(f"[{ep:>3}/{args.episodes}] {result:<9} 步数={steps:<5} "
                   f"出招={att:<4}({rec['att_rate'] * 100:>4.1f}%) "
                   f"距离={rec['mean_dist']:>5.0f}px "
+                  f"纵深={rec['mean_dz']:>4.0f}px 对齐={rec['align_rate'] * 100:>4.1f}% "
                   f"打掉={rec['dealt']:>4.0f} 挨打={rec['taken']:>4.0f} "
                   f"| {rec['secs']:>4.0f}s 剩 {fmt_eta(eta)}")
     except KeyboardInterrupt:
@@ -383,6 +392,8 @@ def main():
     att_rate = total_att / total_steps if total_steps else 0.0
     mean_steps = total_steps / n
     mean_dist = sum(e['mean_dist'] for e in episodes) / n
+    mean_dz = sum(e['mean_dz'] for e in episodes) / n
+    align_rate = sum(e['align_rate'] for e in episodes) / n
     mean_dealt = sum(e['dealt'] for e in episodes) / n
     mean_taken = sum(e['taken'] for e in episodes) / n
 
@@ -414,7 +425,9 @@ def main():
 
     print()
     print(f'平均局长    {mean_steps:7.0f} 帧（约 {mean_steps / 45:.0f} 秒/局）')
-    print(f'平均距离    {mean_dist:7.0f} px')
+    print(f'平均距离    {mean_dist:7.0f} px   （水平 |dx|）')
+    print(f'平均纵深    {mean_dz:7.0f} px   （|dz|，越小越贴同一条深度线）')
+    print(f'纵深对齐率  {align_rate * 100:7.1f}%   <- |dz| <= 12px（zwidth）才可能打中')
     print(f'出招占比    {att_rate * 100:7.1f}%   '
           f'<- 随机策略基线 {RANDOM_ATTACK_RATE * 100:.1f}%')
     if att_rate < RANDOM_ATTACK_RATE * 0.5:
@@ -441,6 +454,8 @@ def main():
             'win_rate': wins / n, 'win_rate_ci': [lo, hi],
             'win_rate_decisive': (wins / decisive) if decisive else None,
             'mean_len': mean_steps, 'mean_dist': mean_dist,
+            'mean_dz': mean_dz, 'align_rate': align_rate,
+            'alignment_zwidth': 12.0,
             'attack_rate': att_rate, 'random_attack_rate': RANDOM_ATTACK_RATE,
             'mean_dealt': mean_dealt, 'mean_taken': mean_taken,
             'distinct_len': n_distinct, 'elapsed_secs': round(elapsed, 1),

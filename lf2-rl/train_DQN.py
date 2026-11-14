@@ -6,7 +6,8 @@ train_DQN.py — Davis vs Dennis Double DQN 訓練主程式
     1. TensorBoard 训练曲线 —— 写进 logs/DQN_N/，tag 命名对齐 SB3 的 PPO（logs/PPO_N），
        所以 `tensorboard --logdir logs` 里两条路线的曲线可以直接叠在一张图上比；
     2. 富评估 —— evaluate() 返回的指标和 eval.py 的报告同口径（胜率 + Wilson CI、
-       出招占比 vs 45.5% 随机基线、平均距离、打掉/挨打血量），既写进 TB 也写 CSV；
+       出招占比 vs 41.7% 随机基线、平均水平距离、平均纵深 |dz| 与对齐率、打掉/挨打血量），
+       既写进 TB 也写 CSV；
     3. 断点续训 —— checkpoint 存 optimizer / total_steps / episode，`--resume` 接着跑。
 
 用法（前提：8765 空闲，serve.py + 浏览器页面已开）：
@@ -40,18 +41,21 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from env import DIFF_NAMES, LF2Env, diff_arg, resolve_diff
+from env import (ACTION_KEYS, DIFF_NAMES, LF2Env, OBS_SCALE,
+                 diff_arg, resolve_diff)
 from rl_metrics import (
     ATTACK_ACTIONS, RANDOM_ATTACK_RATE,
-    action_entropy, action_name, dist_px, hp_from_obs, is_attack, wilson,
+    action_entropy, action_name, depth_aligned, dist_px, dz_px,
+    hp_from_obs, is_attack, wilson,
 )
 
 # =====================================================
 # 超參數
 # =====================================================
 EPISODES        = int(os.environ.get('LF2_EPISODES', '5000'))   # 總訓練場數
-OBS_DIM         = 13      # 觀察值維度（必須與 env.py 的 observation_space 一致）
-ACT_DIM         = 11      # 動作數量
+# 从 env.py 推导，别再手写数字：观测/动作空间改动后这里自动跟上
+OBS_DIM         = len(OBS_SCALE)   # 觀察值維度
+ACT_DIM         = len(ACTION_KEYS) # 動作數量
 
 GAMMA           = 0.99    # 折扣因子
 LR              = 1e-3    # 學習率
@@ -214,7 +218,8 @@ def evaluate(q_net, env, device, n_episodes=EVAL_EPISODES):
     actions = Counter()
     steps_list = []
     total_steps = total_att = 0
-    dist_sum = 0.0
+    dist_sum = dz_sum = 0.0
+    aligned = 0
     dealt_sum = taken_sum = total_reward = 0.0
 
     with torch.no_grad():
@@ -234,6 +239,8 @@ def evaluate(q_net, env, device, n_episodes=EVAL_EPISODES):
                 ep_reward += reward
                 steps += 1
                 dist_sum += dist_px(obs)
+                dz_sum += dz_px(obs)
+                aligned += depth_aligned(obs)
 
             hp_d, hp_e = hp_from_obs(obs)
             dealt_sum += max(0.0, hp0_e - hp_e)
@@ -265,6 +272,8 @@ def evaluate(q_net, env, device, n_episodes=EVAL_EPISODES):
         'timeout_rate': (results['max_steps'] + results['timeout']) / n,
         'attack_rate': total_att / total_steps if total_steps else 0.0,
         'mean_dist': dist_sum / total_steps if total_steps else 0.0,
+        'mean_dz': dz_sum / total_steps if total_steps else 0.0,
+        'align_rate': aligned / total_steps if total_steps else 0.0,
         'dealt': dealt_sum / n,
         'taken': taken_sum / n,
         'action_counts': actions,
@@ -368,7 +377,8 @@ EP_FIELDS = ['episode', 'total_steps', 'result', 'reward', 'steps', 'epsilon',
 
 EVAL_FIELDS = ['episode', 'total_steps', 'n', 'wins', 'loses', 'win_rate',
                'ci_low', 'ci_high', 'win_rate_decisive', 'avg_reward', 'avg_len',
-               'timeout_rate', 'attack_rate', 'mean_dist', 'dealt', 'taken',
+               'timeout_rate', 'attack_rate', 'mean_dist', 'mean_dz',
+               'align_rate', 'dealt', 'taken',
                'distinct_len', 'eval_secs'] + [f'a{a:02d}' for a in range(ACT_DIM)]
 
 
@@ -721,6 +731,7 @@ def train(resume=None, episodes=None, eval_every=None, eval_episodes=None,
                 print(f'  勝率：{ev["win_rate"]:.1%} {ci}  |  平均 reward：{ev["avg_reward"]:.3f}')
                 print(f'  局长 {ev["avg_len"]:.0f} 帧 | 出招 {ev["attack_rate"] * 100:.1f}% '
                       f'(随机基线 {RANDOM_ATTACK_RATE * 100:.1f}%) | '
+                      f'纵深 {ev["mean_dz"]:.0f}px 对齐 {ev["align_rate"] * 100:.1f}% | '
                       f'打掉 {ev["dealt"]:.0f} / 挨打 {ev["taken"]:.0f} hp')
 
                 writer.add_scalar('eval/win_rate', ev['win_rate'], s)
@@ -733,6 +744,8 @@ def train(resume=None, episodes=None, eval_every=None, eval_episodes=None,
                 writer.add_scalar('eval/timeout_rate', ev['timeout_rate'], s)
                 writer.add_scalar('eval/attack_rate', ev['attack_rate'], s)
                 writer.add_scalar('eval/mean_dist', ev['mean_dist'], s)
+                writer.add_scalar('eval/mean_dz', ev['mean_dz'], s)
+                writer.add_scalar('eval/align_rate', ev['align_rate'], s)
                 writer.add_scalar('eval/dealt', ev['dealt'], s)
                 writer.add_scalar('eval/taken', ev['taken'], s)
                 writer.add_scalar('eval/distinct_len', ev['distinct_len'], s)
@@ -749,7 +762,8 @@ def train(resume=None, episodes=None, eval_every=None, eval_episodes=None,
                     row = {k: ev[k] for k in ('n', 'wins', 'loses', 'win_rate',
                                               'ci_low', 'ci_high', 'avg_reward',
                                               'avg_len', 'timeout_rate', 'attack_rate',
-                                              'mean_dist', 'dealt', 'taken',
+                                              'mean_dist', 'mean_dz', 'align_rate',
+                                              'dealt', 'taken',
                                               'distinct_len')}
                     row.update({'episode': episode, 'total_steps': s,
                                 'win_rate_decisive': ev['win_rate_decisive'],
@@ -777,6 +791,7 @@ def train(resume=None, episodes=None, eval_every=None, eval_episodes=None,
                     'win_rate_decisive': ev['win_rate_decisive'],
                     'avg_reward': ev['avg_reward'], 'avg_len': ev['avg_len'],
                     'attack_rate': ev['attack_rate'], 'mean_dist': ev['mean_dist'],
+                    'mean_dz': ev['mean_dz'], 'align_rate': ev['align_rate'],
                     'dealt': ev['dealt'], 'taken': ev['taken'],
                     'distinct_len': ev['distinct_len'],
                     'action_counts': {action_name(a): c

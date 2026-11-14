@@ -14,25 +14,38 @@ ACTION_KEYS = [
     ['left'],
     ['right'],
     ['jump'],
-    ['down'],
+    ['down'],      # 纵深向下（朝镜头），不是蹲
     ['att'],
     ['def'],
     ['left', 'att'],
     ['right', 'att'],
     ['jump', 'att'],
     ['down', 'att'],
+    ['up'],        # 纵深向上（远离镜头）。必须与 match.js 的 ACTION_MAP 一致
+    # 12–15：斜向移动。没有斜向动作时一帧只能追一个轴，追 x 和追 z 互斥；
+    # 引擎的移动判定读 con.state 的两个轴（character.js:216-219），手动确认可斜走。
+    ['left', 'down'],   # 12: 左+纵深向下
+    ['right', 'down'],  # 13: 右+纵深向下
+    ['left', 'up'],     # 14: 左+纵深向上
+    ['right', 'up'],    # 15: 右+纵深向上
 ]
 
+# 前 13 项是原观测（x/y/hp/mp/frame/dir ×2 + dx），后 3 项是纵深：
+# Davis 的 z、Dennis 的 z、dz = davis_z - dennis_z。
+# 纵深实际范围约 289–510（背景数据各不相同），所以用 200 缩放、2.0 平移，
+# 落在约 ±0.55（绝对 z）和 ±1.1（dz），不会被 ±2 截断。
 OBS_SCALE = np.array([
     400.0, 100.0, 500.0, 500.0, 200.0, 1.0,
     400.0, 100.0, 500.0, 500.0, 200.0, 1.0,
     400.0,
+    200.0, 200.0, 200.0,
 ], dtype=np.float32)
 
 OBS_OFFSET = np.array([
     1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
     1.0, 0.0, 0.0, 0.0, 0.0, 0.0,
     0.0,
+    2.0, 2.0, 0.0,
 ], dtype=np.float32)
 
 # ---------------------------------------------------------------------------
@@ -56,14 +69,42 @@ MAX_EPISODE_STEPS = int(os.environ.get('LF2_MAX_STEPS', '3000'))
 # ---------------------------------------------------------------------------
 # 奖励常数（完整推导和调参建议见项目根目录 reward.md）
 # ---------------------------------------------------------------------------
-# 必须与 train.py 里 PPO 的 gamma 一致：势函数塑形用的是 γΦ(s') - Φ(s)
-REWARD_GAMMA = 0.99
-# 势函数塑形的总权重。注意它乘的是“势差”，不是每帧固定给分
-SHAPING_SCALE = 0.5
+# 距离奖励：每「净靠近 1 像素」给 MOVE_REWARD，靠近和远离对称。
+#
+#   d_t = hypot(dx_t, Z_WEIGHT * dz_t)
+#   r_t += MOVE_REWARD * (d_{t-1} - d_t)
+#
+# 三代版本的教训（都是在这份代码上实测出来的，别凭感觉回调）：
+#   1. 望远镜势差 0.5*(γΦ'-Φ)（commit 83b638c）：整局总和上界 0.5，
+#      一次胜利 ≈ 500hp*2.0 + 200 ≈ 1200 —— 0.04%，PPO 的 advantage 归一化之后
+#      等于 0，1.2M 步训出的策略在几百个状态上给同一个 argmax（见 check_policy.py）。
+#   2. 逐帧值 0.5*(1 - d/600)：量级够了（整局 ~750），但它是「只要在附近就一直给」，
+#      而 Easy AI 会自己追过来 —— 站着不动也照拿，策略于是塌成常数动作
+#      （300k/320k 的 checkpoint 整局按 left_down）。刷得到分，学不到走位。
+#   3. 本版：只认「距离变小」。没变就没分，退一步还扣回去，所以
+#      「站着不动」和「来回踱步」（只奖靠近不罚远离会出现）都刷不到分。
+#      全速靠近 5px/帧 → +0.5/帧；整局净靠近 470px → ~47，相对一次胜利 4%。
+#      注意这里**不截断距离**：截断会让 600px 之外完全没有梯度，逃跑阶段就废了；
+#      望远镜求和本身有界（≤ MOVE_REWARD * 场地宽度），不需要 clip。
+MOVE_REWARD = 0.1
+# 距离里 dz 的权重。
+#   z 走路速度只有 x 的一半（davis.js: walking_speed 5 vs walking_speedz 2.5）。
+#   Z_WEIGHT=2 时两轴每帧等价：MOVE*v_x = MOVE*W*v_z = 0.5/帧。
+#   但 1.2M 那版实测：残血追击阶段（AI 往 z 跑）策略完全不碰纵深 ——
+#   |dz| 从 0 拉到 80，P(朝对手的纵向) 反而从 0.29 掉到 0.19，argmax 始终横向攻击。
+#   原因：追 80px 纵深要连按 37 帧、全程只有 ~13 分，而一拳命中是 40–100，
+#   信号被噪声盖住；横向是从 400px 外开始追、累计上百，才学得会。
+#   取 5 → 每帧纵深的收益是横向的 2.5 倍：追击时纵向 1.17/帧 vs 横向 0.18/帧，
+#   追满 80px 约 46 分，和一拳同量级。仍是双边差分，退开照样扣分，没有刷分漏洞。
+Z_WEIGHT = 5.0
 # 每点伤害的奖励 / 惩罚
 HIT_REWARD = 2.0          # 打中 Dennis
 HURT_PENALTY = 0.5        # 自己挨打（原 0.1，太便宜）
 STEP_PENALTY = 0.01       # 每帧小惩罚，鼓励尽快结束战斗
+# 纵深没对上还乱挥的惩罚。命中要求 |dz| <= 12（zwidth），这里留 8px 余量抵消
+# 动作延迟 1–2 帧（z 速度 2.5px/帧），所以阈值用 20。按「按下攻击键时看到的状态」判。
+WHIFF_DZ = 20.0
+WHIFF_PENALTY = 0.05
 # 胜负与超时
 WIN_BONUS = 200.0
 LOSS_PENALTY = 10.0
@@ -120,22 +161,32 @@ def diff_arg(value):
 
 
 def state_to_obs(state):
-    """把一帧游戏状态转成 13 维观测。
+    """把一帧游戏状态转成 16 维观测。
 
     独立成模块级函数（原来是 LF2Env 的方法，但方法体根本不用 self）。这样 pve.py
     这种「只驱动模型、不管回合」的脚本可以直接复用，不必再抄一份 OBS_SCALE / OBS_OFFSET
     —— 以后改观测定义只需要改这一处。
+
+    注意坐标约定：y 是跳跃高度（落地恒为 0），z 才是屏幕上的纵深。
+    纵深特征追加在最后，原有下标（hp=2/8、dx=12）保持不变。
     """
     d = state['davis']
     e = state['dennis']
+    if 'z' not in d or 'z' not in e:
+        raise KeyError(
+            "游戏状态里没有 z：页面还在跑旧版 match.js。"
+            "请用 serve.py（禁缓存）重新打开浏览器，或强制刷新页面。"
+        )
     dir_map = {'right': 1.0, 'left': -1.0}
     dx = d['x'] - e['x']
+    dz = d['z'] - e['z']
     raw = np.array([
         d['x'], d['y'], d['hp'], d['mp'],
         float(d['frame']), dir_map.get(d['dir'], 0.0),
         e['x'], e['y'], e['hp'], e['mp'],
         float(e['frame']), dir_map.get(e['dir'], 0.0),
         dx,
+        d['z'], e['z'], dz,
     ], dtype=np.float32)
     obs = raw / OBS_SCALE - OBS_OFFSET
     return np.clip(obs, -2.0, 2.0)
@@ -152,9 +203,9 @@ class LF2Env(gym.Env):
         self.observed_difficulty = None
         self.observed_ai = None
         self.observation_space = spaces.Box(
-            low=-2.0, high=2.0, shape=(13,), dtype=np.float32
+            low=-2.0, high=2.0, shape=(len(OBS_SCALE),), dtype=np.float32
         )
-        self.action_space = spaces.Discrete(11)
+        self.action_space = spaces.Discrete(len(ACTION_KEYS))
         self.ws = None
         self.latest_state = None
         self.prev_state = None
@@ -238,7 +289,7 @@ class LF2Env(gym.Env):
         # 具体实现在模块级 state_to_obs()，这里只做委托，语义和以前完全一致
         return state_to_obs(state)
 
-    def _compute_reward(self, prev, curr):
+    def _compute_reward(self, prev, curr, action):
         if prev is None:
             return 0.0
 
@@ -251,22 +302,27 @@ class LF2Env(gym.Env):
         reward += (-e_hp_delta) * HIT_REWARD
         reward += d_hp_delta * HURT_PENALTY      # d_hp_delta <= 0
 
-        # 距离：奖励“靠近的过程”，而不是“已经贴得近”。
-        # 势函数 Φ(s) = -min(|dx|, 300) / 300 ∈ [-1, 0]，塑形 = γΦ(s') - Φ(s)：
-        #   * 站着不动时只剩 (γ-1)Φ（每帧 ≤ +0.005），再减掉每帧惩罚后必为负，
-        #     所以贴脸不动、缩在角落都刷不到分；
-        #   * dx 截到 300，是为了让 Φ 有界 —— 否则 γ<1 时望远镜求和会留下
-        #     (γ-1)ΣΦ 的漂移，距离越远漂移越大，反而会奖励“躲到远处”。
-        #   * Φ 在整个 episode 上望远镜求和，总量只有 0.5 量级，
-        #     不会像旧版那样累积到上千、盖过伤害和胜负信号。
-        dx_prev = min(abs(prev['davis']['x'] - prev['dennis']['x']), 300.0)
-        dx_curr = min(abs(curr['davis']['x'] - curr['dennis']['x']), 300.0)
-        phi_prev = -dx_prev / 300.0
-        phi_curr = -dx_curr / 300.0
-        reward += SHAPING_SCALE * (REWARD_GAMMA * phi_curr - phi_prev)
+        # 距离：只奖「净靠近」，靠近和远离对称（推导见 MOVE_REWARD 的注释）。
+        # 二维距离 = hypot(dx, Z_WEIGHT * dz)：命中要求纵深对齐（zwidth=12），
+        # 所以「对齐纵深」和「横向靠近」用同一条距离；z 加权见 Z_WEIGHT。
+        # 不截断：望远镜求和本身有界（≤ MOVE_REWARD * 场地宽度），
+        # 截断反而会让远处完全没有梯度。
+        dx_prev = prev['davis']['x'] - prev['dennis']['x']
+        dz_prev = prev['davis']['z'] - prev['dennis']['z']
+        dx_curr = curr['davis']['x'] - curr['dennis']['x']
+        dz_curr = curr['davis']['z'] - curr['dennis']['z']
+        dist_prev = float(np.hypot(dx_prev, Z_WEIGHT * dz_prev))
+        dist_curr = float(np.hypot(dx_curr, Z_WEIGHT * dz_curr))
+        reward += MOVE_REWARD * (dist_prev - dist_curr)
 
         # 每帧小惩罚，鼓励尽快结束战斗
         reward -= STEP_PENALTY
+
+        # 纵深没对上还乱挥：命中窗口只有 |dz| <= 12，这里放在 20px 之外才罚，
+        # 给动作延迟留余量，免得把“下一帧就进窗口”的攻击也罚掉。
+        # 用 dz_prev 是因为它才是模型做这次决策时看到的状态。
+        if 'att' in ACTION_KEYS[action] and abs(dz_prev) > WHIFF_DZ:
+            reward -= WHIFF_PENALTY
 
         # 胜负
         if curr['dennis']['hp'] <= 0:
@@ -497,13 +553,13 @@ class LF2Env(gym.Env):
             with self._lock:
                 s = self.latest_state
             # 连接已经断了的时候 latest_state 可能是 None，给一个占位观测
-            obs = self._state_to_obs(s) if s is not None else np.zeros(13, dtype=np.float32)
+            obs = self._state_to_obs(s) if s is not None else np.zeros(len(OBS_SCALE), dtype=np.float32)
             # 主动让页面重开一局，避免下一局从中局开始
             self._request_reload()
             return obs, -5.0, False, True, {'result': 'timeout'}
 
         obs = self._state_to_obs(curr)
-        reward = self._compute_reward(self.prev_state, curr)
+        reward = self._compute_reward(self.prev_state, curr, action)
 
         # 正常结束：有人死亡
         terminated = curr['davis']['hp'] <= 0 or curr['dennis']['hp'] <= 0
