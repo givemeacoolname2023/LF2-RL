@@ -12,22 +12,38 @@ var rl_reloading = false;  // 防止重复 reload
 // Headless mode: ?headless 参数跳过 canvas 渲染，大幅提速
 var rl_headless = (window.location.search.indexOf('headless') !== -1);
 
-// 把页面 URL 里的难度换成 level（0/1/2），用来响应 env.py 的切换难度请求。
-// 只改 diff=N 这一个 token：不能用 URLSearchParams，因为它会输出 debug= / headless=，
+// 把页面 URL 里的 diff / seed 换成指定值，用来响应 env.py 的切换难度 / 换种子请求。
+// 只改指定的那个 token：不能用 URLSearchParams，因为它会输出 debug= / headless=，
 // 而 manager.js:254 的 `else if (param.debug)` 靠真值判断，空串会让页面退回主菜单，
 // 训练端就再也收不到状态了。
-function rl_url_with_diff(level) {
+function rl_set_url_param(base, name, value) {
+  var re = new RegExp('([?&])' + name + '(?:=[^&]*)?(?=&|$)')
+  if (re.test(base)) {
+    return base.replace(re, '$1' + name + '=' + value)
+  }
+  return base + (base.indexOf('?') >= 0 ? '&' : '?') + name + '=' + value
+}
+
+// level 为 null/非法 → 不动 diff；seed / bg 同理。
+function rl_url_with_nav(level, seed, bg) {
   var href = window.location.href
   var hashAt = href.indexOf('#')
   var hash = hashAt >= 0 ? href.slice(hashAt) : ''
   var base = hashAt >= 0 ? href.slice(0, hashAt) : href
-  var re = /([?&])diff(?:=[^&]*)?(?=&|$)/g
-  if (re.test(base)) {
-    base = base.replace(re, '$1diff=' + level)
-  } else {
-    base += (base.indexOf('?') >= 0 ? '&' : '?') + 'diff=' + level
+  if (level === 0 || level === 1 || level === 2) {
+    base = rl_set_url_param(base, 'diff', level)
+  }
+  if (typeof seed === 'number' && isFinite(seed)) {
+    base = rl_set_url_param(base, 'seed', seed)
+  }
+  if (typeof bg === 'number' && isFinite(bg)) {
+    base = rl_set_url_param(base, 'bg', bg)
   }
   return base + hash
+}
+
+function rl_url_with_diff(level) {
+  return rl_url_with_nav(level, null, null)
 }
 
 var ACTION_MAP = [
@@ -83,13 +99,24 @@ function rl_inject_action(action) {
       try { msg = JSON.parse(e.data); } catch (err) { return; }
       // 后端要求重开一局（回合结束/超时/页面停在主菜单时由 env.py 主动请求）
       if (msg.cmd === 'reload') {
-        // 带 diff 时顺带切换难度：改写 URL 再导航，新页面 start_debug() 会读
-        // param.diff 选出对应的对手 AI。不带 diff 时行为与原来完全一致。
+        // 带 diff / seed 时顺带改写 URL 再导航：新页面 start_debug() 读 param.diff 选对手 AI，
+        // manager.js 读 param.seed 播种（决定出生点和 AI 的随机序列）。
+        // 两个都不带时行为与原来完全一致（纯 reload，沿用页面上的 URL）。
         var level = (msg.diff === undefined || msg.diff === null)
           ? NaN : parseInt(msg.diff, 10)
-        if (level === 0 || level === 1 || level === 2) {
-          var target = rl_url_with_diff(level)
-          console.log('[RL] 切换难度 diff=' + level + ' -> ' + target)
+        var seed = (msg.seed === undefined || msg.seed === null)
+          ? NaN : parseInt(msg.seed, 10)
+        var bg = (msg.bg === undefined || msg.bg === null)
+          ? NaN : parseInt(msg.bg, 10)
+        var hasLevel = (level === 0 || level === 1 || level === 2)
+        var hasSeed = isFinite(seed)
+        var hasBg = isFinite(bg)
+        if (hasLevel || hasSeed || hasBg) {
+          var target = rl_url_with_nav(hasLevel ? level : null,
+            hasSeed ? seed : null, hasBg ? bg : null)
+          console.log('[RL] 重开一局 diff=' + (hasLevel ? level : '-')
+            + ' seed=' + (hasSeed ? seed : '-')
+            + ' bg=' + (hasBg ? bg : '-') + ' -> ' + target)
           window.location.replace(target);   // 不留 history，效果等同一次 reload
         } else {
           window.location.reload();
@@ -467,6 +494,12 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
         // 由 manager.js 的 start_debug 写进 window，用来让训练/评估日志能写明在打谁
         difficulty: window.rl_difficulty,
         ai: window.rl_ai_name,
+        // 本局实际生效的随机种子（manager.js 从 ?seed= 读，缺省 824163532）；
+        // env.py 用它校验「要的种子」和「页面真的用了的种子」是否一致
+        seed: window.rl_seed,
+        // 本局的背景场地在 bg_list 里的下标（?bg= 可钉住）；各场地宽度差 4 倍，
+        // 观测缩放只对 ~800 宽的场地成立，所以评估时必须记录/校验它
+        bg: window.rl_bg,
         davis: {
           x: davis.ps.x, y: davis.ps.y, z: davis.ps.z,
           hp: davis.health.hp, mp: davis.health.mp,

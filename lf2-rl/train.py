@@ -203,12 +203,12 @@ class BestModelCallback(BaseCallback):
             writer.writerow(row)
 
 
-def main(diff=None):
+def main(diff=None, resume=None, seed_base=None, bg=None):
     print("初始化环境...")
     # 难度在本地先解析一遍：冒烟测试会把 LF2Env 换成没有 .diff 的假环境，
     # 打印不能依赖 env 实例上的属性。
     level = resolve_diff(diff)
-    env = LF2Env(diff=diff)
+    env = LF2Env(diff=diff, seed_base=seed_base, bg=bg)
 
     print("请先启动静态服务和浏览器（两个终端，端口要一致）：")
     print(f"  python serve.py --port {HTTP_PORT}")
@@ -223,18 +223,28 @@ def main(diff=None):
         print("[难度] 未指定 --diff，沿用页面 URL 里的难度（旧行为）。")
     print("等待连接...")
 
-    model = PPO(
-        "MlpPolicy",
-        env,
-        n_steps=2048,        # 原来 512，调大让每次更新见到更多样本
-        batch_size=64,
-        learning_rate=1e-4,
-        n_epochs=5,
-        gamma=0.99,
-        ent_coef=0.01,
-        verbose=1,
-        tensorboard_log=TB_DIR,
-    )
+    if resume:
+        # 从 checkpoint 续训（例如用 Easy 训好的权重去适应 Normal）。
+        # 超参（lr / ent_coef / gamma / n_steps…）随 checkpoint 一起恢复，这里的 PPO(...) 不再生效。
+        # 注意 total_timesteps 是「绝对步数」：learn() 默认 reset_num_timesteps=True，
+        # 所以下面的 TOTAL_TIMESTEPS 是**本次追加**的步数，不是累计。
+        print(f"[续训] 从 {resume} 加载权重（观测/动作/奖励必须与训练时一致）")
+        model = PPO.load(resume, env=env, tensorboard_log=TB_DIR)
+        print(f"[续训] lr={model.learning_rate} ent_coef={model.ent_coef} "
+              f"n_steps={model.n_steps} gamma={model.gamma}；本次追加 {TOTAL_TIMESTEPS} 步")
+    else:
+        model = PPO(
+            "MlpPolicy",
+            env,
+            n_steps=2048,        # 原来 512，调大让每次更新见到更多样本
+            batch_size=64,
+            learning_rate=1e-4,
+            n_epochs=5,
+            gamma=0.99,
+            ent_coef=0.01,
+            verbose=1,
+            tensorboard_log=TB_DIR,
+        )
 
     print("开始训练！浏览器最小化即可，训练在后台继续")
     # 定期把权重存进 checkpoints/，这样中途 Ctrl+C 也不会整场白跑
@@ -283,8 +293,67 @@ def _parse_args(argv=None):
              "不给则沿用页面 URL 里的设置（旧行为）。"
              "指定后 env.py 会切换已打开的浏览器并校验。",
     )
+    parser.add_argument(
+        "--seed-base",
+        type=int,
+        default=None,
+        help="每局随机种子的基准（第 i 局用 seed_base+i）。不给 = 沿用页面写死的 "
+             "824163532（每局同一个开局，模型只见过一种开局）。",
+    )
+    parser.add_argument(
+        "--bg",
+        type=int,
+        default=None,
+        metavar="INDEX",
+        help="钉住背景场地（bg_list 下标 0–8）。不给 = 随机选场地 —— "
+             "但各场地宽度 794~3200 差 4 倍，而观测缩放只对 ~800 宽成立，"
+             "训练时务必固定，否则等于让模型同时学四个不同的游戏。",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="从这个 checkpoint 继续训练（.zip 可省），比如 lf2_ppo.zip。"
+             "超参随 checkpoint 恢复；--timesteps 表示**追加**的步数。"
+             "观测/动作/奖励必须与训练时一致，否则加载或训练会直接报错。",
+    )
+    # 下面三个原来是纯环境变量（LF2_TIMESTEPS / LF2_SAVE_DIR / LF2_FINAL_PATH）。
+    # 环境变量在 cmd.exe 里写法不同、也容易忘，所以加一份等价的命令行参数：
+    # 传了就覆盖环境变量，不传就完全沿用原来的默认值。
+    parser.add_argument(
+        "--timesteps", type=int, default=None, metavar="N",
+        help="本次训练追加多少步（默认 1200000，可用 LF2_TIMESTEPS 覆盖）。"
+             "续训时这是**追加**步数，不是累计。",
+    )
+    parser.add_argument(
+        "--save-dir", default=None, metavar="DIR",
+        help="checkpoint 目录（默认 checkpoints，可用 LF2_SAVE_DIR 覆盖）。"
+             "训练新的一轮时务必换个目录，否则会同名覆盖掉旧 checkpoint。",
+    )
+    parser.add_argument(
+        "--final-path", default=None, metavar="PATH",
+        help="训练结束时存的模型路径（默认 lf2_ppo，可用 LF2_FINAL_PATH 覆盖）。",
+    )
     return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
-    main(diff=_parse_args().diff)
+    _args = _parse_args()
+
+    # 命令行参数覆盖模块级常量（这里是模块作用域，直接赋值即可）。
+    # 必须在 main() 之前：main() 靠名字取这些全局量。
+    if _args.timesteps is not None:
+        TOTAL_TIMESTEPS = _args.timesteps
+    if _args.save_dir:
+        SAVE_DIR = _args.save_dir
+        # BEST_PATH 的默认值是 SAVE_DIR/best_model；用户没显式给 LF2_BEST_PATH 时跟着走，
+        # 否则 best_model.zip 还会写进旧目录。
+        if "LF2_BEST_PATH" not in os.environ:
+            BEST_PATH = os.path.join(SAVE_DIR, "best_model")
+    if _args.final_path:
+        FINAL_PATH = _args.final_path
+
+    print(f"[配置] 追加步数={TOTAL_TIMESTEPS}  checkpoint 目录={SAVE_DIR}  "
+          f"最终模型={FINAL_PATH}.zip  最优模型={BEST_PATH}.zip")
+
+    main(diff=_args.diff, resume=_args.resume,
+         seed_base=_args.seed_base, bg=_args.bg)

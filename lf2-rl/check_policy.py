@@ -14,10 +14,16 @@
 坐标约定（LF/livingobject.js:484 `dirv`）：up → vz<0，down → vz>0，
     所以 dz = davis_z - dennis_z > 0 时（自己在对手下方）应该按 up。
 
+朝向约定：默认让角色**朝向对手**（dx>0 朝右、dx<0 朝左），和真实对局一致。
+    这一条曾经是个坑：老版本写死 dir='right' 却去测 dx<0，等于喂了一个几乎不存在的
+    状态，把 240k 那个「100% 朝对手走」的模型误判成「不分左右」。想复现旧行为用
+    `--facing right`。
+
 用法（在 lf2-rl 目录下，conda activate lf2rl）：
     python check_policy.py
     python check_policy.py --model lf2_ppo.zip
-    python check_policy.py --model checkpoints/ppo_100000_steps.zip
+    python check_policy.py --model checkpoints_seed/ppo_240000_steps.zip
+    python check_policy.py --model lf2_ppo.zip --facing right   # 旧口径，仅供对照
 """
 
 import argparse
@@ -39,13 +45,23 @@ DZ_GRID = (-60, 0, 60)
 FRAME_GRID = (0, 20, 40)
 
 
-def build_state(dx, dz, frame=0, hp=1000, ehp=1000):
-    """造一帧和真实对局同量级的状态（x 在场地中间，z 用 100 的基准）。"""
+def build_state(dx, dz, frame=0, hp=1000, ehp=1000, face=None):
+    """造一帧和真实对局同量级的状态。
+
+    朝向默认跟着 dx 走：真实对局里角色会转向对手，而固定 dir='right' 却在
+    测 dx<0 是在喂一个几乎不存在的状态 —— 之前就是这里让 240k 的模型被误判成
+    「不分左右」，换成一致朝向后同一个 checkpoint 的 argmax 是 100% 朝对手的。
+
+    坐标取 x=400 / z=400：落在 bg=4（2400 宽、z 300–510）的正常范围内。
+    z 用 100 会落到真实分布之外（obs[13] 会跑到 −1.5，而实际只到约 ±0.55）。
+    """
+    if face is None:
+        face = 'right' if dx >= 0 else 'left'
     return {
-        'davis': {'x': 200, 'y': 0, 'z': 100, 'hp': hp, 'mp': 0,
-                  'frame': frame, 'dir': 'right'},
-        'dennis': {'x': 200 + dx, 'y': 0, 'z': 100 - dz, 'hp': ehp, 'mp': 0,
-                   'frame': frame, 'dir': 'left'},
+        'davis': {'x': 400, 'y': 0, 'z': 400, 'hp': hp, 'mp': 0,
+                  'frame': frame, 'dir': face},
+        'dennis': {'x': 400 + dx, 'y': 0, 'z': 400 - dz, 'hp': ehp, 'mp': 0,
+                   'frame': frame, 'dir': 'left' if face == 'right' else 'right'},
     }
 
 
@@ -78,7 +94,12 @@ def main():
                          '即 checkpoints/best_model.zip')
     ap.add_argument('--margin', type=float, default=0.02,
                     help='判定「有反应」所需的最小概率差（默认 0.02）')
+    ap.add_argument('--facing', choices=('auto', 'right'), default='auto',
+                    help='造状态时角色的朝向。auto（默认）= 跟着 dx 走，和真实对局一致；'
+                         'right = 一律朝右（旧行为，只在 dx>=0 时才有物理意义，'
+                         '拿它测 dx<0 会把好策略误判成 FAIL）。')
     args = ap.parse_args()
+    face = None if args.facing == 'auto' else 'right'
 
     path = args.model
     if path is None:
@@ -104,7 +125,7 @@ def main():
         pl = pr = 0.0
         ams = []
         for frame in FRAME_GRID:
-            p = action_probs(model, state_to_obs(build_state(dx, 0, frame)))
+            p = action_probs(model, state_to_obs(build_state(dx, 0, frame, face=face)))
             pl += p[LEFT].sum()
             pr += p[RIGHT].sum()
             am = int(p.argmax())
@@ -138,7 +159,7 @@ def main():
         pu = pd = 0.0
         ams = []
         for frame in FRAME_GRID:
-            p = action_probs(model, state_to_obs(build_state(0, dz, frame)))
+            p = action_probs(model, state_to_obs(build_state(0, dz, frame, face=face)))
             pu += p[UP].sum()
             pd += p[DOWN].sum()
             am = int(p.argmax())

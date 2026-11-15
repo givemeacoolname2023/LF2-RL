@@ -236,6 +236,14 @@ def main():
                              'DQN 没有可采样的分布，用 softmax(Q/温度) 代替。')
     parser.add_argument('--temperature', type=float, default=1.0,
                         help='仅 DQN 的 --stochastic 用：softmax(Q/T) 的温度（默认 1.0）')
+    parser.add_argument('--seed-base', type=int, default=10000,
+                        help='每局随机种子的基准：第 i 局（从 0 起）用 seed_base+i，'
+                             '让每局开局不同、但整组可复现（默认 10000）。'
+                             '传负数 = 关闭，沿用页面里写死的固定种子 824163532（老行为）。')
+    parser.add_argument('--bg', type=int, default=None, metavar='INDEX',
+                        help='钉住背景场地（bg_list 下标 0–8）。不给 = 沿用页面原来的随机选择。'
+                             '各场地宽度 794~3200 差 4 倍，而观测缩放只对 ~800 宽成立，'
+                             '所以「换开局」的评估必须固定场地，否则换 seed 等于换游戏。')
     parser.add_argument('--diff', type=diff_arg,
                         choices=('easy', 'normal', 'difficult'), default=None,
                         help='对手难度，可写 easy / normal / difficult 或 0 / 1 / 2；'
@@ -289,8 +297,15 @@ def main():
     print()
 
     # ---- 3. 建环境和模型（只能建一个 LF2Env，8765 写死了）----
+    seed_base = None if args.seed_base < 0 else int(args.seed_base)
+    if seed_base is None:
+        print('[种子] 已关闭（所有局共用页面里写死的 824163532，结果不可当独立样本）')
+    else:
+        print(f'[种子] base={seed_base}，第 i 局用 seed={seed_base}+i（i 从 0 起）')
+    if args.bg is not None:
+        print(f'[场地] 固定 bg={args.bg}（不固定的话换 seed 会连场地一起换掉）')
     try:
-        env = LF2Env(diff=args.diff)
+        env = LF2Env(diff=args.diff, seed_base=seed_base, bg=args.bg)
     except Exception as e:
         print(f'[错误] 创建环境失败：{e}')
         return 1
@@ -315,6 +330,16 @@ def main():
 
     try:
         for ep in range(1, args.episodes + 1):
+            # 环境种子由 env.reset() 按局号算（seed_base + 局号），这里只固定「策略采样」的 RNG，
+            # 否则 --stochastic 下同一局重跑两次，动作序列还是不一样，谈不上可复现。
+            ep_seed = None if seed_base is None else seed_base + (ep - 1)
+            if ep_seed is not None:
+                torch.manual_seed(ep_seed)
+                np.random.seed(ep_seed % (2 ** 32))
+                _sb3 = getattr(model, 'model', None)
+                if _sb3 is not None and hasattr(_sb3, 'set_random_seed'):
+                    _sb3.set_random_seed(ep_seed)
+                print(f'[种子] 第 {ep} 局 seed={ep_seed}')
             try:
                 obs, _ = env.reset()
             except (TimeoutError, RuntimeError) as e:
@@ -351,6 +376,8 @@ def main():
             hp_e = float(obs[IDX_E_HP]) * OBS_SCALE[IDX_E_HP]
             rec = {
                 'ep': ep,
+                'seed': ep_seed,
+                'bg': env.observed_bg,
                 'result': result,
                 'steps': steps,
                 'att': att,
@@ -366,7 +393,8 @@ def main():
 
             left = args.episodes - ep
             eta = (time.time() - t_start) / ep * left
-            print(f"[{ep:>3}/{args.episodes}] {result:<9} 步数={steps:<5} "
+            print(f"[{ep:>3}/{args.episodes}] bg={rec['bg']} seed={rec['seed']} "
+                  f"{result:<9} 步数={steps:<5} "
                   f"出招={att:<4}({rec['att_rate'] * 100:>4.1f}%) "
                   f"距离={rec['mean_dist']:>5.0f}px "
                   f"纵深={rec['mean_dz']:>4.0f}px 对齐={rec['align_rate'] * 100:>4.1f}% "
@@ -466,6 +494,15 @@ def main():
             'difficulty_index': env.diff,
             'difficulty_observed': env.observed_difficulty,
             'ai_observed': env.observed_ai,
+            # 种子协议：写报告时照着这三个字段就能逐局复现
+            'seed_base': seed_base,
+            'seed_scheme': (None if seed_base is None
+                            else '第 i 局（从 0 起）seed = seed_base + i'),
+            'seeds': [e['seed'] for e in episodes],
+            # 场地：各背景宽度差 4 倍，不固定的话换 seed 等于换游戏
+            'bg_requested': args.bg,
+            'bg_observed': env.observed_bg,
+            'bgs': [e['bg'] for e in episodes],
         }
         try:
             with open(args.json, 'w', encoding='utf-8') as f:

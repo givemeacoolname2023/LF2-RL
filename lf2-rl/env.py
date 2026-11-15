@@ -193,15 +193,34 @@ def state_to_obs(state):
 
 
 class LF2Env(gym.Env):
-    def __init__(self, diff=None):
+    def __init__(self, diff=None, seed_base=None, bg=None):
         super().__init__()
         # 本次运行要求的难度；None = 完全沿用页面 URL 的设置（旧行为）。
         # 放在 _start_server() 之前：非法的 diff 在占端口之前就抛错。
         self.diff = resolve_diff(diff)
         self.diff_name = DIFF_NAMES.get(self.diff)
-        # 最近一局实际观察到的难度/对手，供 eval.py 的 JSON 汇总引用
+        # 每局不同的随机种子：第 i 局（从 0 起）用 seed_base + i。
+        # None = 不发 seed（页面用 manager.js 里写死的 824163532，训练的老行为）。
+        # 不改它的话，每一局都是同一个出生点 + 同一串 AI 随机决策，20 局等于 1 局。
+        if seed_base is not None:
+            seed_base = int(seed_base)
+            if seed_base < 0:
+                raise ValueError(f"seed_base 必须 >= 0（收到 {seed_base}）")
+        self.seed_base = seed_base
+        self._current_seed = None
+        # 固定背景场地（bg_list 下标）。None = 沿用页面原本的随机选择。
+        # 各场地宽度 794~3200 差 4 倍，而观测缩放只对 ~800 宽成立 ——
+        # 换场地等于换一个游戏，所以「换开局」的实验必须把它钉住。
+        if bg is not None:
+            bg = int(bg)
+            if bg < 0:
+                raise ValueError(f"bg 必须 >= 0（收到 {bg}）")
+        self.bg = bg
+        # 最近一局实际观察到的难度/对手/种子，供 eval.py 的 JSON 汇总引用
         self.observed_difficulty = None
         self.observed_ai = None
+        self.observed_seed = None
+        self.observed_bg = None
         self.observation_space = spaces.Box(
             low=-2.0, high=2.0, shape=(len(OBS_SCALE),), dtype=np.float32
         )
@@ -274,16 +293,24 @@ class LF2Env(gym.Env):
         keys = ACTION_KEYS[action]
         self._send_raw({"action": int(action), "keys": keys})
 
-    def _request_reload(self, diff=None):
-        """请浏览器刷新页面、重开一局；带 diff 时顺带把页面 URL 的难度改掉。
+    def _request_reload(self, diff=None, seed=None, bg=None):
+        """请浏览器刷新页面、重开一局；带 diff / seed / bg 时顺带改掉页面 URL 里的参数。
 
-        diff 缺省取 self.diff，所以 _ensure_fresh / step 里现有的调用点都不用改，
-        难度会自动跨局保留。self.diff is None 时发出去的内容和以前逐字一致。
+        diff 缺省取 self.diff、seed 缺省取 self._current_seed、bg 缺省取 self.bg，
+        所以 _ensure_fresh / step 里现有的调用点都不用改，难度/种子/场地会自动跨局保留。
+        三者都取不到时，发出去的内容和以前逐字一致（{"cmd": "reload"}）。
         """
         diff = self.diff if diff is None else diff
-        if diff is None:
-            return self._send_raw({"cmd": "reload"})
-        return self._send_raw({"cmd": "reload", "diff": int(diff)})
+        seed = self._current_seed if seed is None else seed
+        bg = self.bg if bg is None else bg
+        payload = {"cmd": "reload"}
+        if diff is not None:
+            payload["diff"] = int(diff)
+        if seed is not None:
+            payload["seed"] = int(seed)
+        if bg is not None:
+            payload["bg"] = int(bg)
+        return self._send_raw(payload)
 
     def _state_to_obs(self, state):
         # 具体实现在模块级 state_to_obs()，这里只做委托，语义和以前完全一致
@@ -467,8 +494,18 @@ class LF2Env(gym.Env):
         # 2) 把难度切到 --diff 要求的值（没指定时是 no-op）。
         #    必须在“认领新局”之前，否则会先接受一局错误难度的对局。
         self._apply_difficulty()
-        # 3) 如果当前已经是新局，直接用
-        if self._wait_new_round(GRACE_TIME):
+        # 3) 如果当前已经是新局、且种子/场地都对得上，直接用。
+        #    对不上（例如第一局时页面还是默认种子、或换到了别的场地）必须当“没准备好”，
+        #    走下面的重开流程。
+        with self._lock:
+            s = self.latest_state
+        seed_ok = (self._current_seed is None or
+                   (s is not None and s.get('seed') is not None
+                    and int(s['seed']) == self._current_seed))
+        bg_ok = (self.bg is None or
+                 (s is not None and s.get('bg') is not None
+                  and int(s['bg']) == self.bg))
+        if seed_ok and bg_ok and self._wait_new_round(GRACE_TIME):
             return
         # 4) 否则主动请页面重开（最多 4 次）
         for attempt in range(4):
@@ -496,7 +533,11 @@ class LF2Env(gym.Env):
 
     def reset(self, seed=None, options=None):
         self._episode += 1
-        print(f"[Reset] 第 {self._episode} 局开始，等待游戏连接...")
+        # 本局的随机种子：第 1 局 = seed_base + 0
+        self._current_seed = (None if self.seed_base is None
+                              else self.seed_base + (self._episode - 1))
+        seed_note = '' if self._current_seed is None else f"，seed={self._current_seed}"
+        print(f"[Reset] 第 {self._episode} 局开始{seed_note}，等待游戏连接...")
         with self._lock:
             self.latest_state = None
             self.prev_state = None
@@ -509,6 +550,27 @@ class LF2Env(gym.Env):
             self._session_in_use = state.get('session', self._session_in_use)
         self.observed_difficulty = state.get('difficulty')
         self.observed_ai = state.get('ai')
+        self.observed_seed = state.get('seed')
+        self.observed_bg = state.get('bg')
+        # 场地校验：各场地宽度差 4 倍而观测只对 ~800 宽成立，跑错场地等于跑错游戏。
+        if self.bg is not None:
+            if self.observed_bg is None:
+                raise RuntimeError(
+                    "页面状态里没有 bg：浏览器还在跑旧版 match.js。请强制刷新页面。")
+            if int(self.observed_bg) != self.bg:
+                raise RuntimeError(
+                    f"场地校验失败：要求 bg={self.bg}，页面报告 {self.observed_bg}。")
+        # 种子校验：页面报的种子必须就是本局要的那个，否则同样的种子记录没法复现。
+        # 旧版页面（match.js 里没有 seed 字段）会在这里报 None —— 强制刷新即可。
+        if self._current_seed is not None:
+            if self.observed_seed is None:
+                raise RuntimeError(
+                    "页面状态里没有 seed：浏览器还在跑旧版 match.js。"
+                    "请用 serve.py（禁缓存）重新打开页面，或强制刷新。")
+            if int(self.observed_seed) != self._current_seed:
+                raise RuntimeError(
+                    f"种子校验失败：要求 seed={self._current_seed}，"
+                    f"页面报告 {self.observed_seed}。拒绝在这个种子下继续评估。")
         # 最后一道闸：_apply_difficulty 之后如果又发生重载/人工干预，这里也不会放过
         if self.diff is not None and self.observed_difficulty != self.diff:
             raise RuntimeError(

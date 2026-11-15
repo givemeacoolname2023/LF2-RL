@@ -227,7 +227,11 @@ define(['LF/global', 'LF/network', 'LF/soundpack', 'LF/match', 'LF/util', 'LF/to
           return randomseed.next()
         }
         randomseed = new Random()
-        randomseed.seed(824163532)
+        // 默认固定种子（训练行为与以前完全一致）；评估时由 env.py 通过 ?seed=N 指定，
+        // 让每一局有不同的出生点和 AI 随机序列，同时又可复现（同 N 必得同一局）。
+        var urlSeed = parseInt(param.seed, 10)
+        window.rl_seed = Number.isFinite(urlSeed) ? urlSeed : 824163532
+        randomseed.seed(window.rl_seed)
 
         // prepare
         char_list = util.select_from(pack.data.object, { type: 'character' })
@@ -1497,9 +1501,22 @@ define(['LF/global', 'LF/network', 'LF/soundpack', 'LF/match', 'LF/util', 'LF/to
         }
         function get_background() {
           const options = config.options
+          // 场地也是从同一个随机流里选的：换 seed 会顺手换场地，
+          // 而各场地宽度 794~3200 差 4 倍（观测缩放只按 ~800 写死）。
+          // 所以 RL 侧可以用 ?bg=<下标> 把它钉住，只变开局不变场地。
+          if (options.background === -1 && param.bg !== undefined) {
+            const bi = parseInt(param.bg, 10)
+            if (bi >= 0 && bi < bg_list.length) {
+              window.rl_bg = bi
+              return bg_list[bi].id
+            }
+          }
           if (options.background === -1) {
-            return bg_list[Math.floor(randomseed.next() * bg_list.length)].id
+            const idx = Math.floor(randomseed.next() * bg_list.length)
+            window.rl_bg = idx
+            return bg_list[idx].id
           } else {
+            window.rl_bg = options.background
             return bg_list[options.background].id
           }
         }
