@@ -97,18 +97,27 @@ MOVE_REWARD = 0.1
 #   取 5 → 每帧纵深的收益是横向的 2.5 倍：追击时纵向 1.17/帧 vs 横向 0.18/帧，
 #   追满 80px 约 46 分，和一拳同量级。仍是双边差分，退开照样扣分，没有刷分漏洞。
 Z_WEIGHT = 5.0
-# 每点伤害的奖励 / 惩罚
-HIT_REWARD = 2.0          # 打中 Dennis
-HURT_PENALTY = 0.5        # 自己挨打（原 0.1，太便宜）
+# 伤害：按「净血量优势」对称给分，打掉对手 1 点和自己掉 1 点等值。
+#
+# 旧版是 2.0 / −0.5（打中给得多、挨打扣得少），盈亏点在 `打掉 > 0.25 × 挨打` ——
+# 也就是说打掉 1 点血、挨打 2 点血，一个明显吃亏的交换仍然是 +1.0 的正收益。
+# 实测后果（2026-11-18，1.2M 步闭环实验）：
+#   模型把「打掉 464 / 挨打 352」当成好成绩（奖励 +752），
+#   但换成对称计数只有 +112，而 20 局胜率停在 40% 不动 —— 训练回报从 544 涨到 770，
+#   胜率一步没涨。所以这一项必须对称，否则策略优化的根本不是「赢」。
+DAMAGE_REWARD = 1.0       # 每点净血量优势
 STEP_PENALTY = 0.01       # 每帧小惩罚，鼓励尽快结束战斗
 # 纵深没对上还乱挥的惩罚。命中要求 |dz| <= 12（zwidth），这里留 8px 余量抵消
 # 动作延迟 1–2 帧（z 速度 2.5px/帧），所以阈值用 20。按「按下攻击键时看到的状态」判。
 WHIFF_DZ = 20.0
 WHIFF_PENALTY = 0.05
-# 胜负与超时
+# 胜负与超时。终局也必须对称，否则「输」的代价远小于「赢」的收益，
+# 策略会倾向于稳一点打完而不是去争取胜利。
 WIN_BONUS = 200.0
-LOSS_PENALTY = 10.0
-TIMEOUT_PENALTY = 20.0    # 超时截断：比输更亏，杜绝拖时间
+LOSS_PENALTY = 200.0
+# 超时必须明显大于「僵持的收益」：对称化之后，双方各掉 350 血的僵持是 0 分，
+# 若超时只扣 20，那「缩着不打」就比「冒险进攻但可能输（−200）」划算得多。
+TIMEOUT_PENALTY = 50.0
 # 难度下标 → 名字，只为打印。数值来自 manager.js 的 diff_list，
 # 对手 AI 由 URL 的 ?debug&diff=0/1/2 决定（0 是 dumbass，2 是 Crusher）。
 DIFF_NAMES = {0: 'Easy', 1: 'Normal', 2: 'Difficult'}
@@ -325,9 +334,10 @@ class LF2Env(gym.Env):
         e_hp_delta = curr['dennis']['hp'] - prev['dennis']['hp']
         reward = 0.0
 
-        # 打中 Dennis / 自己挨打
-        reward += (-e_hp_delta) * HIT_REWARD
-        reward += d_hp_delta * HURT_PENALTY      # d_hp_delta <= 0
+        # 净血量优势：打掉对手的血 减去 自己损失的血，等权重（见 DAMAGE_REWARD 注释）。
+        # 双方各掉 350 血 → 0 分；对手掉 10、自己掉 5 → +5。
+        reward += (d_hp_delta - e_hp_delta) * DAMAGE_REWARD
+        #                             ↑ d_hp_delta <= 0（挨打），取「对手掉血 − 自己掉血」
 
         # 距离：只奖「净靠近」，靠近和远离对称（推导见 MOVE_REWARD 的注释）。
         # 二维距离 = hypot(dx, Z_WEIGHT * dz)：命中要求纵深对齐（zwidth=12），

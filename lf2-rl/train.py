@@ -203,7 +203,7 @@ class BestModelCallback(BaseCallback):
             writer.writerow(row)
 
 
-def main(diff=None, resume=None, seed_base=None, bg=None):
+def main(diff=None, resume=None, seed_base=None, bg=None, ent_coef=None):
     print("初始化环境...")
     # 难度在本地先解析一遍：冒烟测试会把 LF2Env 换成没有 .diff 的假环境，
     # 打印不能依赖 env 实例上的属性。
@@ -245,6 +245,12 @@ def main(diff=None, resume=None, seed_base=None, bg=None):
             verbose=1,
             tensorboard_log=TB_DIR,
         )
+
+    # --ent-coef 必须在两个分支之后统一覆盖：续训时超参来自 checkpoint，
+    # 改上面 PPO(...) 里的默认值对 --resume 完全无效。
+    if ent_coef is not None:
+        model.ent_coef = float(ent_coef)
+        print(f"[超参] ent_coef 覆盖为 {model.ent_coef}")
 
     print("开始训练！浏览器最小化即可，训练在后台继续")
     # 定期把权重存进 checkpoints/，这样中途 Ctrl+C 也不会整场白跑
@@ -316,6 +322,15 @@ def _parse_args(argv=None):
              "超参随 checkpoint 恢复；--timesteps 表示**追加**的步数。"
              "观测/动作/奖励必须与训练时一致，否则加载或训练会直接报错。",
     )
+    parser.add_argument(
+        "--ent-coef",
+        type=float,
+        default=None,
+        metavar="C",
+        help="熵正则系数（不给 = 沿用代码里的 0.01 / checkpoint 里存的值）。"
+             "注意：--resume 时超参是从 checkpoint 恢复的，改代码里的默认值没用，"
+             "必须用这个开关（它在 PPO.load 之后覆盖）才会生效。",
+    )
     # 下面三个原来是纯环境变量（LF2_TIMESTEPS / LF2_SAVE_DIR / LF2_FINAL_PATH）。
     # 环境变量在 cmd.exe 里写法不同、也容易忘，所以加一份等价的命令行参数：
     # 传了就覆盖环境变量，不传就完全沿用原来的默认值。
@@ -356,4 +371,4 @@ if __name__ == "__main__":
           f"最终模型={FINAL_PATH}.zip  最优模型={BEST_PATH}.zip")
 
     main(diff=_args.diff, resume=_args.resume,
-         seed_base=_args.seed_base, bg=_args.bg)
+         seed_base=_args.seed_base, bg=_args.bg, ent_coef=_args.ent_coef)
