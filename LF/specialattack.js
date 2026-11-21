@@ -52,7 +52,9 @@ define(['LF/livingobject', 'LF/global', 'core/util'],
 
           case 'hit':
           case 'hit_others':
-            $.match.sound.play($.data.bmp.weapon_broken_sound)
+            if ($.data.bmp.weapon_broken_sound) {
+              $.match.sound.play($.data.bmp.weapon_broken_sound)
+            }
             break
 
           case 'die':
@@ -134,12 +136,13 @@ define(['LF/livingobject', 'LF/global', 'core/util'],
         const $ = this
         switch (event) {
           case 'hit_others':
+            const attackerEffect = att.frame.D.itr?.effect
             // check if att is ice or fire
-            if (ITR.effect === 3 && att.type === 'specialattack' && att.state() === 3000 && att.frame.D.itr.effect !== 3 && att.frame.D.itr.effect !== 2) {
+            if (ITR.effect === 3 && att.type === 'specialattack' && att.state() === 3000 && attackerEffect !== 3 && attackerEffect !== 2) {
               // freeze ball hit another non freeze ball
               return
             }
-            if (ITR.effect !== 3 && ITR.effect !== 2 && att.type === 'specialattack' && att.frame.D.itr.effect === 3) { // non freeze or fire ball hit another freeze ball
+            if (ITR.effect !== 3 && ITR.effect !== 2 && att.type === 'specialattack' && attackerEffect === 3) { // non freeze or fire ball hit another freeze ball
               $.ps.vx = 0
               $.trans.frame(1000)
               $.match.create_object({ kind: 1, x: 41, y: 50, action: 0, dvx: 0, dvy: 0, oid: 209, facing: 0 }, att)
@@ -150,7 +153,8 @@ define(['LF/livingobject', 'LF/global', 'core/util'],
             break
 
           case 'hit': // hit by others
-            if ($.frame.D.itr.kind === 14) // ice column
+            const projectileItr = $.frame.D.itr
+            if (projectileItr?.kind === 14) // ice column
             {
               $.trans.set_wait(0, 20) // go to break frame
               return true
@@ -160,12 +164,12 @@ define(['LF/livingobject', 'LF/global', 'core/util'],
               return false
             }
             // check if att is ice or fire
-            if ($.frame.D.itr.effect === 3 && att.type === 'specialattack' && att.state() === 3000 && att.frame.D.itr.effect !== 3 && att.frame.D.itr.effect !== 2) {
+            if (projectileItr?.effect === 3 && att.type === 'specialattack' && att.state() === 3000 && att.frame.D.itr?.effect !== 3 && att.frame.D.itr?.effect !== 2) {
               // freeze ball hit by non freeze ball
               return true
             }
             if (att.type === 'specialattack') {
-              if ($.frame.D.itr.effect !== 3 && $.frame.D.itr.effect !== 2 && ITR.effect === 3) { // non freeze or fire ball hit by freeze ball
+              if (projectileItr?.effect !== 3 && projectileItr?.effect !== 2 && ITR.effect === 3) { // non freeze or fire ball hit by freeze ball
                 $.ps.vx = 0
                 $.trans.frame(1000)
                 $.match.create_object({ kind: 1, x: 41, y: 50, action: 0, dvx: 0, dvy: 0, oid: 209, facing: 0 }, att)

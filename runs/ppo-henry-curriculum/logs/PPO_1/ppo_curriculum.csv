@@ -1,0 +1,4 @@
+total_steps,stage,difficulty,reason,previous_stage_steps,win_rate
+0,1,0,start,0,
+245760,2,1,max_steps,245760,
+638976,3,2,max_steps,393216,

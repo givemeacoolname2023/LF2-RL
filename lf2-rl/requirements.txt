@@ -1,0 +1,4 @@
+stable-baselines3>=2.5,<3
+playwright>=1.49,<2
+tensorboard
+websockets>=13,<17

@@ -1,17 +1,11 @@
-"""rl_metrics.py —— 观测下标、出招判定、Wilson 置信区间。
-
-为什么单独成一个文件：
-    `eval.py`（离线评估）和 `train_DQN.py` 的 `evaluate()`（训练中评估）必须给出
-    **同一个口径**的数字，否则报告里「评估胜率 60%」和「训练曲线上的 eval/win_rate 45%」
-    对不上，还没法判断是谁错了。把这几条定义放在一处，只改这里就不会漂。
-
-    只依赖 `env.py`（取 ACTION_KEYS / OBS_SCALE）和标准库，没有副作用。
-"""
+"""观测下标、出招判定、Wilson 置信区间。"""
 
 import math
 from collections import Counter
 
 from env import ACTION_KEYS, OBS_SCALE
+
+MIN_CENTER_DAMAGE_RATIO = 0.70
 
 # 观测里的下标（对应 env.py 的 state_to_obs）
 IDX_D_HP = 2    # davis hp  = obs[2] * OBS_SCALE[2]
@@ -24,6 +18,7 @@ IDX_DZ = 15     # dz = davis_z - dennis_z = obs[15] * OBS_SCALE[15]
 
 # 含 'att' 的动作算一次出招：5=攻 7=左攻 8=右攻 9=跳攻 10=下攻
 ATTACK_ACTIONS = sorted(i for i, keys in enumerate(ACTION_KEYS) if 'att' in keys)
+HENRY_SPECIAL_ACTIONS = {16: 'gust', 17: 'piercing_arrow', 18: 'multiple_shot', 19: 'sonata'}
 # 随机策略的出招占比基线：出招动作数 / 总动作数（随 ACTION_KEYS 自动变化）
 RANDOM_ATTACK_RATE = len(ATTACK_ACTIONS) / len(ACTION_KEYS)
 
@@ -36,12 +31,12 @@ def hp_from_obs(obs):
 
 def dist_px(obs):
     """双方水平距离（像素，取绝对值）。"""
-    return abs(float(obs[IDX_DX]) * OBS_SCALE[IDX_DX])
+    return abs(float(obs[IDX_DX] * OBS_SCALE[IDX_DX]))
 
 
 def dz_px(obs):
     """双方纵深距离（像素，取绝对值）。"""
-    return abs(float(obs[IDX_DZ]) * OBS_SCALE[IDX_DZ])
+    return abs(float(obs[IDX_DZ] * OBS_SCALE[IDX_DZ]))
 
 
 def depth_aligned(obs, zwidth=12.0):
@@ -49,13 +44,15 @@ def depth_aligned(obs, zwidth=12.0):
     return dz_px(obs) <= zwidth
 
 
-def is_attack(action):
+def is_attack(action, character='davis'):
     """这个动作算不算出招。"""
-    return action in ATTACK_ACTIONS
+    return action in ATTACK_ACTIONS or (character == 'henry' and action in HENRY_SPECIAL_ACTIONS)
 
 
-def action_name(action):
+def action_name(action, character='davis'):
     """动作的可读名字，也是 TensorBoard 的 tag 片段（不要带空格/斜杠）。"""
+    if character == 'henry' and action in HENRY_SPECIAL_ACTIONS:
+        return HENRY_SPECIAL_ACTIONS[action]
     keys = ACTION_KEYS[action]
     return '_'.join(keys) if keys else 'noop'
 

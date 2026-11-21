@@ -9,6 +9,8 @@ from gymnasium import spaces
 import threading
 import time
 
+POLICY_CHARACTERS = ('davis', 'henry')
+
 ACTION_KEYS = [
     [],
     ['left'],
@@ -28,6 +30,14 @@ ACTION_KEYS = [
     ['right', 'down'],  # 13: 右+纵深向下
     ['left', 'up'],     # 14: 左+纵深向上
     ['right', 'up'],    # 15: 右+纵深向上
+]
+ACTION_KEYS += [
+    ['def', 'toward', 'att'],
+    ['toward', 'def', 'down', 'att'],
+    ['toward', 'def', 'up', 'att'],
+    ['toward', 'def', 'up', 'jump'],
+    ['approach'],
+    ['toward', 'att'],
 ]
 
 # 前 13 项是原观测（x/y/hp/mp/frame/dir ×2 + dx），后 3 项是纵深：

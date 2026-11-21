@@ -107,6 +107,15 @@ define(['core/util'], function (Futil) {
     const $ = this.self
     return Math.floor($.match.random() * i)
   }
+  const frame_states = new Map()
+  function frame_state(value) {
+    if (!frame_states.has(value)) {
+      const read = () => value
+      read.valueOf = read
+      frame_states.set(value, read)
+    }
+    return frame_states.get(value)
+  }
   AIin.prototype.frame = function (N) {
     const $ = this.self
     const tags = { bdy: 'make_array', itr: 'make_array', wpoint: 'object' }
@@ -128,6 +137,8 @@ define(['core/util'], function (Futil) {
             } else if (tags[I] === 'object') {
               O[I] = $.data.frame[N][I]
             }
+          } else if (I === 'state') {
+            O[I] = frame_state($.data.frame[N][I])
           } else {
             O[I] = $.data.frame[N][I]
           }

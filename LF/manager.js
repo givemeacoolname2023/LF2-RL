@@ -246,7 +246,22 @@ define(['LF/global', 'LF/network', 'LF/soundpack', 'LF/match', 'LF/util', 'LF/to
         diff_list = ['Easy', 'Normal', 'Difficult']
 
         this.create_UI()
-        if (param.demo) {
+        if (param.rlstep) {
+          window.rl_reset_match = ({diff, seed, bg, character = 'davis', opponent = null}) => {
+            if (!bg_list[bg]) throw new Error('Invalid LF2 background: ' + bg)
+            if (window.rl_match) window.rl_match.destroy()
+            for (const index of [0, 1]) {
+              const controller = session.control[index]
+              controller.flush()
+              controller.clear_states()
+            }
+            window.rl_seed = seed
+            randomseed.seed(seed)
+            param.diff = diff
+            param.bg = bg
+            this.start_debug(opponent ? 'human' : 'computer', character, opponent)
+          }
+        } else if (param.demo) {
           this.start_demo(true)
         } else if (param.demo_display) {
           this.start_demo(false)
@@ -1548,28 +1563,31 @@ define(['LF/global', 'LF/network', 'LF/soundpack', 'LF/match', 'LF/util', 'LF/to
       // p2_type 只影响 Dennis 的 type：
       //   start_debug()        → 'computer'，训练和评估走这条（行为必须保持不变）
       //   start_debug('human') → 人是 Dennis、模型是 Davis，用于 ?pve 真人对打
-      this.start_debug = function (p2_type) {
+      this.start_debug = function (p2_type, character = 'davis', opponent = null) {
         const diff = difficulty_index()
         const ai_index = DIFF_TO_AI[diff]
+        const selected = name => char_list.findIndex(entry => entry.name.toLowerCase() === name)
+        const first = selected(character)
+        const second = selected(opponent || 'dennis')
         // 交给 match.js 一起推进每帧状态，Python 侧才能把难度写进训练日志
         window.rl_difficulty = diff
-        window.rl_ai_name = AI_list[ai_index].name
+        window.rl_ai_name = opponent ? 'PPO' : AI_list[ai_index].name
         console.log(`[RL] 难度 ${diff_list[diff]} → 对手 AI: ${AI_list[ai_index].name}`)
         const match = this.start_match({
           players: [
             {
               use: true,
-              name: 'Davis',
+              name: char_list[first].name,
               type: 'human',
-              selected: 10,
+              selected: first,
               selected_AI: 0,
               team: 1
             },
             {
               use: true,
-              name: 'Dennis',
+              name: char_list[second].name,
               type: p2_type || 'computer',
-              selected: 8,
+              selected: second,
               selected_AI: ai_index,
               team: 2
             }

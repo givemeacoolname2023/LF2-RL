@@ -1,374 +1,331 @@
-"""Phase 2: PPO 训练（Stable-Baselines3）
-
-三件事都只为一个目的：一次几小时的长跑不要白费。
-
-1. 每 2 万步存一个 checkpoint —— 中途 Ctrl+C 最多丢 8 分钟
-2. 每 10 万步跑一次贪婪评估，`(胜率, 平均奖励)` 破纪录就存 `checkpoints/best_model.zip`
-   —— 口径与 `train_DQN.py:745` 的 `best_model.pt` 完全一致
-3. 训完再存一份 `lf2_ppo.zip`（最后一个模型，不代表最好）
-
-为什么评估不能用 SB3 自带的 `EvalCallback`：`env.py` 把 ws 服务器写死在 8765 上，
-而且是**按实例**起的，一个进程里只能有一个 `LF2Env`。`EvalCallback` 会新建 env，
-第二个实例绑定端口失败后线程静默死掉，`reset()` 会干等 120 秒再抛 `TimeoutError`。
-所以这里复用训练中的那个 env，并在用完把 `_last_obs` 同步回去。
-
-`smoke_ppo_best.py` 会本文件里的 `LF2Env` / 各路径常量换成假的，用来跑无浏览器的管道测试，
-所以这些都留成模块级全局，`main()` 里按名字查表取，不要在函数内重新算。
-"""
+"""Train PPO with parallel headless LF2 environments and win-rate evaluation."""
 
 import argparse
+from contextlib import ExitStack
 import csv
+import math
 import os
-import time
+from pathlib import Path
 
 import numpy as np
-
-from env import DIFF_NAMES, LF2Env, diff_arg, resolve_diff
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+import torch
 
-# 1200_000大概8小时
-# 训练总步数，可用环境变量覆盖（冒烟测试：LF2_TIMESTEPS=2048 python train.py）
-TOTAL_TIMESTEPS = int(os.environ.get("LF2_TIMESTEPS", "1200_000"))
-# 页面服务端口：只用于打印提示，本脚本本身不监听它（训练用的是 ws 8765，写死在 env.py 里）
-HTTP_PORT = os.environ.get("LF2_PORT", "8000")
-# 每多少步存一个 checkpoint（可用 LF2_CKPT_FREQ 覆盖）。40fps 下 20000 步≈8 分钟：
-# 中途 Ctrl+C 最多丢这么多，不加的话整场训练白跑
-CKPT_FREQ = int(os.environ.get("LF2_CKPT_FREQ", "20000"))
-# 每多少训练步跑一次贪婪评估。0 = 关闭（短跑 / 调试用）
-BEST_EVERY = int(os.environ.get("LF2_BEST_EVERY", "100000"))
-# 每次评估跑几局
-BEST_EPISODES = int(os.environ.get("LF2_BEST_EPISODES", "5"))
-# 落盘位置
-SAVE_DIR = os.environ.get("LF2_SAVE_DIR", "checkpoints")
-FINAL_PATH = os.environ.get("LF2_FINAL_PATH", "lf2_ppo")
-TB_DIR = os.environ.get("LF2_TB_DIR", "./logs/")
-# 最优模型；PPO.save() 会自动补 .zip
-BEST_PATH = os.environ.get("LF2_BEST_PATH", os.path.join(SAVE_DIR, "best_model"))
-# 单次评估里一局最多跑多少步，纯属兜底（正常由 env 的 MAX_EPISODE_STEPS 兜住）
-MAX_EVAL_STEPS = 20000
-
-EVAL_CSV_FIELDS = [
-    "total_steps", "n", "wins", "loses", "win_rate", "avg_reward",
-    "avg_len", "timeout_rate", "best_win_rate",
-]
+from action_selector import ACTION_MODES, ActionSelector, action_mode
+from curriculum import load_config
+from env import ACTION_KEYS, DIFF_NAMES, POLICY_CHARACTERS, diff_arg, resolve_diff
+from parallel_env import ParallelLF2Env, default_workers
+from sync_env import DEFAULT_ASSETS, DEFAULT_MAX_FRAMES, DEFAULT_REPEAT, DEFAULT_SEED, SyncLF2Env, game_server
 
 
-class BestModelCallback(BaseCallback):
-    """按「贪婪评估胜率」保存 checkpoints/best_model.zip。
+def save_model(model, path):
+    temporary = path.with_name(f'.{path.stem}.{os.getpid()}.zip')
+    try:
+        model.save(temporary)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
-    口径与 train_DQN.py 的 best_model.pt 一致：`(win_rate, avg_reward)` 字典序比较，
-    胜率打平才比平均奖励。`best_win_rate` 从 0.0、`best_avg_reward` 从 -inf 起，
-    所以**第一次评估必定落盘** —— 和 DQN 一样，一局没赢也会有 best，报告里引用时看清胜率。
 
-    接管 env 的安全性（SB3 2.5 实测）：
-      - `on_rollout_end()` 在 `collect_rollouts()` 末尾触发，此时 rollout buffer
-        已经 `compute_returns_and_advantage()` 算完；buffer 要等下一次
-        `collect_rollouts()` 开头才 `reset()`，所以往里塞别的局面不会污染训练数据。
-      - `rollout_buffer` / `ep_info_buffer` / `num_timesteps` 都不受
-        `venv.step()` 影响，评估消耗的游戏帧不计入训练预算。
-      - 唯一会脏的是 `model._last_obs` 和 `model._last_episode_starts`
-        （`collect_rollouts()` 每步更新它们）。评估结束后必须重新 reset 并把它们改回来，
-        否则下一次 rollout 会拿着过期观测继续走，那一局的奖励归因全错。
-    """
+def append_csv(path, columns, row):
+    with path.open('a', newline='', encoding='utf-8') as stream:
+        writer = csv.writer(stream)
+        if stream.tell() == 0:
+            writer.writerow(columns)
+        writer.writerow(row)
 
-    def __init__(self, every_steps, n_episodes, save_path, verbose=1):
-        super().__init__(verbose)
-        self.every_steps = every_steps
-        self.n_episodes = max(1, n_episodes)
-        self.save_path = save_path
-        self.best_win_rate = 0.0
-        self.best_avg_reward = float("-inf")
-        self.last_eval_step = 0
-        self.n_evals = 0
-        self._csv_path = None
 
-    # ---- 触发 ----------------------------------------------------------
+class WinRateCallback(BaseCallback):
+    def __init__(self, eval_env, *, every, episodes, seed_base, stages, progress, best_path, evaluate_initial):
+        super().__init__()
+        self.eval_env = eval_env
+        self.every = every
+        self.episodes = episodes
+        self.seed_base = seed_base
+        self.stages = stages
+        self.progress = progress
+        self.target = stages[-1]['difficulty']
+        self.best_path = best_path
+        self.evaluate_initial = evaluate_initial
+        self.best_wins = -1
+        self.last_eval = None
 
-    def _on_step(self) -> bool:
+    def _on_training_start(self):
+        self.last_eval = self.num_timesteps
+        self.log_stage('start')
+        if self.evaluate_initial and self.every:
+            self.evaluate()
+
+    def _on_step(self):
         return True
 
-    def _on_rollout_end(self) -> None:
-        if self.every_steps <= 0:
-            return
-        if self.num_timesteps - self.last_eval_step < self.every_steps:
-            return
-        self.last_eval_step = self.num_timesteps
-        self._evaluate()
+    def _on_rollout_start(self):
+        index = self.progress['stage']
+        stage = self.stages[index]
+        used = self.num_timesteps - self.progress['started_at']
+        due = self.every > 0 and self.num_timesteps - self.last_eval >= self.every
+        reason = None
+        rate = None
+        if index < len(self.stages) - 1:
+            if used >= stage['max_steps']:
+                reason = 'max_steps'
+            elif due and used >= stage['min_steps']:
+                rate = self.score(stage['difficulty']) / self.episodes
+                if rate >= stage['promote_win_rate']:
+                    reason = 'win_rate'
+        if reason:
+            self.progress.update(stage=index + 1, started_at=self.num_timesteps)
+            next_stage = self.stages[index + 1]
+            self.training_env.set_stage(next_stage['difficulty'], next_stage['reward'], restart=True)
+            self.log_stage(reason, used, rate)
+        self.logger.record('curriculum/stage', self.progress['stage'] + 1)
+        self.logger.record('curriculum/difficulty', self.stages[self.progress['stage']]['difficulty'])
+        if due:
+            self.evaluate()
 
-    # ---- 评估 ----------------------------------------------------------
+    def _on_training_end(self):
+        if self.every and self.num_timesteps != self.last_eval:
+            self.evaluate()
+            self.logger.dump(self.num_timesteps)
 
-    def _evaluate(self) -> None:
-        venv = self.training_env
-        t0 = time.time()
-        self.n_evals += 1
-        print(f"\n[评估] 第 {self.num_timesteps} 步，贪婪策略跑 {self.n_episodes} 局...")
+    def evaluate(self):
+        self.model.policy.set_training_mode(False)
+        target_wins = self.score(self.target)
+        if target_wins >= self.best_wins:
+            self.best_wins = target_wins
+            save_model(self.model, self.best_path)
+        self.last_eval = self.num_timesteps
 
-        results, rewards, lengths = [], [], []
-        failed = None
-        try:
-            for i in range(self.n_episodes):
-                obs = venv.reset()
-                ep_rew, ep_len, info = 0.0, 0, {}
-                while ep_len < MAX_EVAL_STEPS:
-                    actions, _ = self.model.predict(obs, deterministic=True)
-                    obs, rews, dones, infos = venv.step(actions)
-                    ep_rew += float(rews[0])
-                    ep_len += 1
-                    info = infos[0]
-                    if dones[0]:
-                        break
-                result = info.get("result", "unknown")
-                results.append(result)
-                rewards.append(ep_rew)
-                lengths.append(ep_len)
-                print(f"  [{i + 1}/{self.n_episodes}] {result:<10} "
-                      f"reward={ep_rew:>8.1f}  {ep_len:>5} 步")
-        except Exception as e:                      # noqa: BLE001
-            failed = e
-        finally:
-            # 评估把游戏跑到别的局里去了，不管跑没跑完都必须把训练现场收回来，
-            # 否则下一次 collect_rollouts 会拿着过期观测继续走。
-            # 这里的 reset 若也失败，说明浏览器已经不可用，让它抛出去（训练继续下去也是垃圾）。
-            obs = venv.reset()
-            self.model._last_obs = obs
-            if hasattr(self.model, "_last_episode_starts"):
-                self.model._last_episode_starts = np.ones((venv.num_envs,), dtype=bool)
-            if hasattr(self.model, "_last_original_obs"):  # 只在套了 VecNormalize 时存在
-                self.model._last_original_obs = obs
+    def log_stage(self, reason, previous_steps=0, rate=None):
+        index = self.progress['stage']
+        difficulty = self.stages[index]['difficulty']
+        print(f'[课程] {self.num_timesteps} 步 | 阶段 {index + 1}/{len(self.stages)} '
+              f'{DIFF_NAMES[difficulty]} | {reason} | 新开对局生效', flush=True)
+        append_csv(Path(self.logger.get_dir()) / 'ppo_curriculum.csv',
+                   ['total_steps', 'stage', 'difficulty', 'reason', 'previous_stage_steps', 'win_rate'],
+                   [self.num_timesteps, index + 1, difficulty, reason, previous_steps, rate])
 
-        if failed is not None:
-            # 一次评估跑失败不该连累几小时的训练：跳过这次，best 保持上一次的
-            print(f"[评估] 没跑完，已跳过（训练继续）：{type(failed).__name__}: {failed}")
-            return
+    def score_parallel(self, difficulty):
+        env = self.eval_env
+        env.set_stage(difficulty, env.reward)
+        env.seed(self.seed_base)
+        obs = env.reset()
+        pending = np.ones(self.episodes, dtype=bool)
+        wins = center_wins = 0
+        selector = ActionSelector(self.model, self.model.lf2_action_mode, self.episodes)
+        while pending.any():
+            actions = selector.predict(obs, env.action_repeat)
+            obs, _, done, infos = env.step(actions)
+            selector.reset(done)
+            for index in np.flatnonzero(pending & done):
+                wins += int(infos[index]['is_success'])
+                center_wins += int(infos[index]['center_win'])
+                pending[index] = False
+        return wins, center_wins
 
-        n = len(results)
-        wins = results.count("win")
-        loses = results.count("lose")
-        win_rate = wins / n
-        avg_reward = sum(rewards) / n
-        avg_len = sum(lengths) / n
-        timeout_rate = sum(1 for r in results if r in ("max_steps", "timeout")) / n
+    def score_browser(self, difficulty):
+        wins = center_wins = 0
+        selector = ActionSelector(self.model, self.model.lf2_action_mode)
+        for index in range(self.episodes):
+            obs, _ = self.eval_env.reset(seed=self.seed_base + index, options={'diff': difficulty})
+            selector.reset()
+            while True:
+                action = selector.predict(obs, self.eval_env.action_repeat)
+                obs, _, terminated, truncated, info = self.eval_env.step(int(action))
+                if terminated or truncated:
+                    wins += int(info['result'] == 'win')
+                    center_wins += int(info['center_win'])
+                    break
+        return wins, center_wins
 
-        improved = (win_rate, avg_reward) > (self.best_win_rate, self.best_avg_reward)
-        if improved:
-            self.best_win_rate = win_rate
-            self.best_avg_reward = avg_reward
-            folder = os.path.dirname(self.save_path)
-            if folder:
-                os.makedirs(folder, exist_ok=True)
-            self.model.save(self.save_path)
-            print(f"  ★ 新最佳胜率 {win_rate:.1%}！模型已存到 {self.save_path}.zip")
+    def score(self, difficulty):
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(self.seed_base)
+            wins, center_wins = (self.score_parallel(difficulty) if isinstance(self.eval_env, ParallelLF2Env)
+                                 else self.score_browser(difficulty))
+        stage = next(stage for stage in self.stages if stage['difficulty'] == difficulty)
+        rate = wins / self.episodes
+        center_rate = center_wins / self.episodes
+        label = f'{self.eval_env.opponent.title()} PPO' if self.eval_env.opponent else DIFF_NAMES[difficulty]
+        print(f'[评估] {self.num_timesteps} 步 | {label} | 胜 {wins}/{self.episodes} ({rate:.1%})'
+              f' | 场中胜 {center_wins}/{self.episodes} ({center_rate:.1%})',
+              flush=True)
+        metric = label.lower().replace(' ', '_')
+        self.logger.record(f'eval/{metric}_win_rate', rate)
+        self.logger.record(f'eval/{metric}_center_win_rate', center_rate)
+        append_csv(Path(self.logger.get_dir()) / 'ppo_eval.csv',
+                   ['total_steps', 'difficulty', 'wins', 'episodes', 'win_rate', 'seed_base'],
+                   [self.num_timesteps, difficulty, wins, self.episodes, rate, self.seed_base])
+        return center_wins if stage['reward']['center_damage'] else wins
 
-        print(f"[评估] 胜率 {win_rate:.1%} ({wins}胜/{loses}负/{n - wins - loses}其他)  "
-              f"平均奖励 {avg_reward:.1f}  平均 {avg_len:.0f} 步  "
-              f"超时率 {timeout_rate:.0%}  用时 {time.time() - t0:.0f}s"
-              + ("" if improved else f"（未破纪录，best 仍是 {self.best_win_rate:.1%}）"))
 
-        if self._tb is not None:
-            self._tb.record("eval/win_rate", win_rate)
-            self._tb.record("eval/best_win_rate", self.best_win_rate)
-            self._tb.record("eval/avg_reward", avg_reward)
-            self._tb.record("eval/timeout_rate", timeout_rate)
-            self._tb.record("eval/avg_len", avg_len)
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description='并行训练 PPO，按目标难度的评估胜率选模型')
+    parser.add_argument('--timesteps', type=int, default=int(os.getenv('LF2_TIMESTEPS', '1200000')))
+    parser.add_argument('--n-envs', type=int, default=4, help='并行环境数（默认 4）')
+    parser.add_argument('--n-workers', type=int, help='Node.js 进程数（默认按可用 CPU，最多 16）')
+    parser.add_argument('--n-steps', type=int, help='每个环境每轮决策步数（默认随环境数缩放）')
+    parser.add_argument('--batch-size', type=int, help='PPO 的小批量大小')
+    parser.add_argument('--n-epochs', type=int, help='PPO 每轮数据的更新遍数')
+    parser.add_argument('--diff', type=diff_arg, help='目标难度（新训练默认 difficult）')
+    parser.add_argument('--no-curriculum', action='store_true', help='直接在目标难度训练')
+    parser.add_argument('--promote-win-rate', type=float, default=0.7)
+    parser.add_argument('--config', type=Path, help='课程和奖励 JSON 配置')
+    parser.add_argument('--action-mode', choices=ACTION_MODES, help='选模和对战出招方式（新训练默认 reengage）')
+    parser.add_argument('--eval-every', type=int, default=int(os.getenv('LF2_BEST_EVERY', '32768')),
+                        help='评估间隔（所有环境合计决策步），0 只按阶段预算晋级')
+    parser.add_argument('--eval-episodes', type=int, default=int(os.getenv('LF2_BEST_EPISODES', '20')))
+    parser.add_argument('--eval-seed-base', type=int, default=10000)
+    parser.add_argument('--seed-base', type=int, default=DEFAULT_SEED)
+    parser.add_argument('--bg', type=int, choices=range(9), help='场地下标（新训练默认 0）')
+    parser.add_argument('--character', choices=POLICY_CHARACTERS, help='PPO 控制的角色（默认 Davis）')
+    parser.add_argument('--opponent-model', type=Path, help='固定的对手 PPO 存档')
+    parser.add_argument('--action-repeat', type=int, help='每次决策推进的帧数（新训练默认 4）')
+    parser.add_argument('--max-frames', type=int, help='每局最多游戏帧数（新训练默认 3000）')
+    parser.add_argument('--assets', type=Path, default=DEFAULT_ASSETS, help='LF2_19 素材目录')
+    parser.add_argument('--browser', help='使用指定的 Chrome / Chromium 做训练中评估')
+    parser.add_argument('--output-dir', type=Path, default=Path('.'))
+    parser.add_argument('--resume', help='继续训练的 PPO .zip 文件；--timesteps 是追加步数')
+    parser.add_argument('--ent-coef', type=float)
+    parser.add_argument('--gamma', type=float, help='PPO 折扣因子（默认 1）')
+    args = parser.parse_args(argv)
+    if (min(args.n_envs, args.timesteps, args.eval_episodes) < 1 or args.eval_every < 0
+            or not 0 < args.promote_win_rate <= 1):
+        parser.error('步数、环境数和评估局数必须为正数，升难度阈值必须在 (0, 1] 内。')
+    if not (0 <= args.seed_base < 2 ** 32 and 0 <= args.eval_seed_base <= 2 ** 32 - args.eval_episodes):
+        parser.error('随机种子必须在无符号 32 位范围内。')
+    if any(value is not None and value < 1 for value in (args.n_workers, args.n_steps, args.n_epochs)):
+        parser.error('进程数、rollout 长度和更新遍数必须为正数。')
+    if args.batch_size is not None and args.batch_size < 2:
+        parser.error('PPO 小批量大小必须至少为 2。')
+    if args.gamma is not None and not 0 < args.gamma <= 1:
+        parser.error('--gamma 必须在 (0, 1] 内。')
+    if args.ent_coef is not None and (not math.isfinite(args.ent_coef) or args.ent_coef < 0):
+        parser.error('--ent-coef 必须是非负有限数。')
+    return args
 
-        self._append_csv(dict(
-            total_steps=self.num_timesteps, n=n, wins=wins, loses=loses,
-            win_rate=round(win_rate, 4), avg_reward=round(avg_reward, 2),
-            avg_len=round(avg_len, 1), timeout_rate=round(timeout_rate, 4),
-            best_win_rate=round(self.best_win_rate, 4),
+
+def main(args):
+    torch.set_num_threads(1)
+    previous = PPO.load(args.resume, device='cpu') if args.resume else None
+    opponent_model = PPO.load(args.opponent_model, device='cpu') if args.opponent_model else None
+    old_config = getattr(previous, 'lf2_config', {})
+    config = {
+        'character': args.character or old_config.get('character', 'davis'),
+        'action_count': int(previous.action_space.n) if previous else len(ACTION_KEYS),
+        'bg': args.bg if args.bg is not None else old_config.get('bg', 0),
+        'action_repeat': (args.action_repeat if args.action_repeat is not None
+                          else old_config.get('action_repeat', 1 if previous else DEFAULT_REPEAT)),
+        'max_frames': (args.max_frames if args.max_frames is not None
+                       else old_config.get('max_frames', DEFAULT_MAX_FRAMES)),
+    }
+    if not 1 <= config['action_repeat'] <= config['max_frames']:
+        raise SystemExit('要求 1 <= --action-repeat <= --max-frames。')
+    target = resolve_diff(args.diff) if args.diff is not None else old_config.get('diff', 2)
+    old_curriculum = getattr(previous, 'lf2_curriculum', None)
+    try:
+        if old_curriculum is not None:
+            for entry in [old_curriculum, *old_curriculum['stages']]:
+                entry.get('reward', {}).pop('opponent_damage', None)
+            old_curriculum = load_config(None, target=old_config.get('diff', 2), timesteps=args.timesteps,
+                                         threshold=args.promote_win_rate, previous=old_curriculum)
+        curriculum = load_config(args.config, target=target, timesteps=args.timesteps,
+                                 threshold=args.promote_win_rate, disabled=args.no_curriculum or opponent_model is not None,
+                                 previous=old_curriculum)
+    except (ValueError, OSError) as exc:
+        raise SystemExit(f'课程或奖励配置无效。{exc}') from exc
+    stages = curriculum['stages']
+    prior_steps = previous.num_timesteps if previous else 0
+    progress = (dict(previous.lf2_progress) if curriculum == old_curriculum
+                else {'stage': 0, 'started_at': prior_steps})
+    stage = stages[progress['stage']]
+    gamma = args.gamma if args.gamma is not None else (previous.gamma if previous else 1.0)
+    n_steps = args.n_steps or (previous.n_steps if previous and previous.n_envs == args.n_envs
+                             else max(8, min(512, 8192 // args.n_envs)))
+    if n_steps < 1 or n_steps * args.n_envs < 2:
+        raise SystemExit('PPO 的每轮合计决策步数必须至少为 2。')
+    rollout_steps = n_steps * args.n_envs
+    train_seed = args.seed_base + prior_steps
+    last_seed = train_seed + math.ceil(args.timesteps / rollout_steps) * rollout_steps + args.n_envs - 1
+    if last_seed >= 2 ** 32:
+        raise SystemExit('训练种子可能越过 32 位整数范围，请降低 --seed-base。')
+    if args.eval_every and train_seed < args.eval_seed_base + args.eval_episodes and last_seed >= args.eval_seed_base:
+        raise SystemExit('训练和评估的种子范围可能重叠，请调整 --seed-base 或 --eval-seed-base。')
+    default_batch = 256 if rollout_steps <= 2048 else 1024
+    batch_size = args.batch_size or min(rollout_steps, default_batch)
+    if batch_size > rollout_steps:
+        raise SystemExit('--batch-size 不能超过 --n-steps × --n-envs。')
+    workers = min(args.n_envs, args.n_workers or default_workers(args.n_envs))
+    checkpoints = args.output_dir / 'checkpoints'
+    checkpoints.mkdir(parents=True, exist_ok=True)
+    logs = str(args.output_dir / 'logs')
+
+    with ExitStack() as resources:
+        venv = ParallelLF2Env(args.assets, n_envs=args.n_envs, n_workers=workers,
+                              diff=stage['difficulty'], gamma=gamma, reward=stage['reward'],
+                              opponent_model=opponent_model, **config)
+        resources.callback(venv.close)
+        epochs = args.n_epochs or (previous.n_epochs if previous else 5)
+        if (previous and previous.n_envs == args.n_envs and previous.n_steps == n_steps
+                and previous.gamma == gamma):
+            model = previous
+            model.set_env(venv)
+            model.tensorboard_log = logs
+            model.batch_size = args.batch_size or min(previous.batch_size, rollout_steps)
+            model.n_epochs = epochs
+        elif previous:
+            model = PPO.load(args.resume, env=venv, device='cpu', tensorboard_log=logs,
+                             n_steps=n_steps, batch_size=batch_size, n_epochs=epochs, gamma=gamma)
+        else:
+            model = PPO(
+                'MlpPolicy', venv, n_steps=n_steps, batch_size=batch_size, n_epochs=epochs,
+                learning_rate=3e-4, gamma=gamma, gae_lambda=0.98, ent_coef=0.01,
+                seed=args.seed_base, device='cpu', verbose=1, tensorboard_log=logs,
+            )
+        venv.seed(train_seed)
+        model.ep_info_buffer = model.ep_success_buffer = None
+        model.lf2_config = {**config, 'diff': target}
+        model.lf2_action_mode = action_mode(previous, args.action_mode, default='reengage')
+        model.__dict__.pop('lf2_reward_model', None)
+        model.lf2_curriculum = curriculum
+        model.lf2_progress = progress
+        if args.ent_coef is not None:
+            model.ent_coef = args.ent_coef
+
+        callbacks = []
+        eval_env = None
+        if args.eval_every:
+            if args.browser:
+                url = resources.enter_context(game_server(args.assets))
+                eval_env = SyncLF2Env(url, diff=target, gamma=gamma, browser=args.browser,
+                                     opponent_model=opponent_model, **config)
+            else:
+                eval_env = ParallelLF2Env(args.assets, n_envs=args.eval_episodes,
+                                          n_workers=min(4, workers), diff=target, gamma=gamma,
+                                          reward=curriculum['reward'], opponent_model=opponent_model, **config)
+            resources.callback(eval_env.close)
+        callbacks.append(WinRateCallback(
+            eval_env, every=args.eval_every, episodes=args.eval_episodes, seed_base=args.eval_seed_base,
+            stages=stages, progress=progress, best_path=checkpoints / 'best_model.zip', evaluate_initial=bool(previous),
         ))
-
-    # ---- 落 CSV --------------------------------------------------------
-
-    @property
-    def _tb(self):
-        """SB3 的 logger。`BaseCallback.logger` 是个转发到 `model.logger` 的 property，
-        模型还没 `_setup_learn()` 过时会直接抛 AttributeError（单测里直接调 _evaluate 就会踩到），
-        所以这里自己取，取不到就当没有。"""
-        return getattr(self.model, "_logger", None)
-
-    def _append_csv(self, row):
-        if self._csv_path is None:
-            # 有 TensorBoard 时 logger.dir 就是 logs/PPO_N；没有就落到 checkpoints/
-            folder = getattr(self._tb, "dir", None)
-            folder = folder or os.path.dirname(self.save_path) or "."
-            os.makedirs(folder, exist_ok=True)
-            self._csv_path = os.path.join(folder, "ppo_eval.csv")
-        new_file = not os.path.isfile(self._csv_path)
-        with open(self._csv_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=EVAL_CSV_FIELDS)
-            if new_file:
-                writer.writeheader()
-            writer.writerow(row)
+        ckpt_freq = int(os.getenv('LF2_CKPT_FREQ', '20000'))
+        if ckpt_freq > 0:
+            callbacks.append(CheckpointCallback(math.ceil(ckpt_freq / args.n_envs), str(checkpoints), 'ppo'))
+        label = f'{venv.opponent.title()} PPO' if venv.opponent else f'Dennis {DIFF_NAMES[target]}'
+        print(f'[PPO] {config["character"].title()} vs {label} | {workers} 进程 | '
+              f'{args.n_envs} 环境 × {n_steps} 步/轮 | 动作重复 {config["action_repeat"]} 帧 | '
+              f'{model.lf2_action_mode}',
+              flush=True)
+        try:
+            model.learn(total_timesteps=args.timesteps, callback=callbacks, reset_num_timesteps=not args.resume)
+        except KeyboardInterrupt:
+            save_model(model, checkpoints / 'interrupted.zip')
+            print('[中断] 已保存 interrupted.zip')
+            return
+        save_model(model, args.output_dir / 'lf2_ppo.zip')
+        print(f'[完成] 模型已保存到 {args.output_dir / "lf2_ppo.zip"}')
 
 
-def main(diff=None, resume=None, seed_base=None, bg=None, ent_coef=None):
-    print("初始化环境...")
-    # 难度在本地先解析一遍：冒烟测试会把 LF2Env 换成没有 .diff 的假环境，
-    # 打印不能依赖 env 实例上的属性。
-    level = resolve_diff(diff)
-    env = LF2Env(diff=diff, seed_base=seed_base, bg=bg)
-
-    print("请先启动静态服务和浏览器（两个终端，端口要一致）：")
-    print(f"  python serve.py --port {HTTP_PORT}")
-    print(f"  python launch_browser.py --port {HTTP_PORT}")
-    print("或者手动打开页面，地址为：")
-    print(f"  http://localhost:{HTTP_PORT}/LF2-RL/game/game.html?debug&headless")
-    print("（8000 被占用时：set LF2_PORT=8010 再跑本脚本；ws 桥固定 8765，不用管）")
-    if level is not None:
-        print(f"[难度] 请求 {DIFF_NAMES[level]}（diff={level}）；"
-              f"env.py 会切换已打开的浏览器并校验，切不过去会直接报错。")
-    else:
-        print("[难度] 未指定 --diff，沿用页面 URL 里的难度（旧行为）。")
-    print("等待连接...")
-
-    if resume:
-        # 从 checkpoint 续训（例如用 Easy 训好的权重去适应 Normal）。
-        # 超参（lr / ent_coef / gamma / n_steps…）随 checkpoint 一起恢复，这里的 PPO(...) 不再生效。
-        # 注意 total_timesteps 是「绝对步数」：learn() 默认 reset_num_timesteps=True，
-        # 所以下面的 TOTAL_TIMESTEPS 是**本次追加**的步数，不是累计。
-        print(f"[续训] 从 {resume} 加载权重（观测/动作/奖励必须与训练时一致）")
-        model = PPO.load(resume, env=env, tensorboard_log=TB_DIR)
-        print(f"[续训] lr={model.learning_rate} ent_coef={model.ent_coef} "
-              f"n_steps={model.n_steps} gamma={model.gamma}；本次追加 {TOTAL_TIMESTEPS} 步")
-    else:
-        model = PPO(
-            "MlpPolicy",
-            env,
-            n_steps=2048,        # 原来 512，调大让每次更新见到更多样本
-            batch_size=64,
-            learning_rate=1e-4,
-            n_epochs=5,
-            gamma=0.99,
-            ent_coef=0.01,
-            verbose=1,
-            tensorboard_log=TB_DIR,
-        )
-
-    # --ent-coef 必须在两个分支之后统一覆盖：续训时超参来自 checkpoint，
-    # 改上面 PPO(...) 里的默认值对 --resume 完全无效。
-    if ent_coef is not None:
-        model.ent_coef = float(ent_coef)
-        print(f"[超参] ent_coef 覆盖为 {model.ent_coef}")
-
-    print("开始训练！浏览器最小化即可，训练在后台继续")
-    # 定期把权重存进 checkpoints/，这样中途 Ctrl+C 也不会整场白跑
-    checkpoint = CheckpointCallback(
-        save_freq=CKPT_FREQ,
-        save_path=SAVE_DIR,
-        name_prefix="ppo",
-    )
-    # 定期贪婪评估，破纪录就把权重存成 checkpoints/best_model.zip
-    best_cb = BestModelCallback(BEST_EVERY, BEST_EPISODES, BEST_PATH)
-    if BEST_EVERY > 0:
-        print(f"[最佳模型] 每 {BEST_EVERY} 步贪婪评估 {BEST_EPISODES} 局，"
-              f"破纪录存 {BEST_PATH}.zip")
-    else:
-        print("[最佳模型] LF2_BEST_EVERY=0，已关闭贪婪评估")
-
-    model.learn(
-        total_timesteps=TOTAL_TIMESTEPS,
-        callback=[checkpoint, best_cb],   # 原来 100k，至少跑 500k 才能看到学习效果
-    )
-    model.save(FINAL_PATH)
-
-    print(f"训练完成！最后一个模型已保存为 {FINAL_PATH}.zip")
-    if best_cb.best_avg_reward > float("-inf"):
-        print(f"最优模型（贪婪胜率 {best_cb.best_win_rate:.1%}）"
-              f"已保存为 {BEST_PATH}.zip —— 评估/部署用这个，不是 {FINAL_PATH}.zip")
-    else:
-        print("这次训练没有跑过任何一次评估，所以没有 best_model.zip")
-
-    return model, best_cb
-
-
-def _parse_args(argv=None):
-    """只解析 --diff。
-
-    刻意不在 main() 里解析：smoke_ppo_best.py 直接无参调用 train.main()，
-    若 main() 自己读 sys.argv，冒烟测试就会被它自己的参数搞挂。
-    """
-    parser = argparse.ArgumentParser(description="PPO 训练（Stable-Baselines3）")
-    parser.add_argument(
-        "--diff",
-        type=diff_arg,
-        choices=("easy", "normal", "difficult"),
-        default=None,
-        help="对手难度，可写 easy / normal / difficult 或 0 / 1 / 2；"
-             "不给则沿用页面 URL 里的设置（旧行为）。"
-             "指定后 env.py 会切换已打开的浏览器并校验。",
-    )
-    parser.add_argument(
-        "--seed-base",
-        type=int,
-        default=None,
-        help="每局随机种子的基准（第 i 局用 seed_base+i）。不给 = 沿用页面写死的 "
-             "824163532（每局同一个开局，模型只见过一种开局）。",
-    )
-    parser.add_argument(
-        "--bg",
-        type=int,
-        default=None,
-        metavar="INDEX",
-        help="钉住背景场地（bg_list 下标 0–8）。不给 = 随机选场地 —— "
-             "但各场地宽度 794~3200 差 4 倍，而观测缩放只对 ~800 宽成立，"
-             "训练时务必固定，否则等于让模型同时学四个不同的游戏。",
-    )
-    parser.add_argument(
-        "--resume",
-        default=None,
-        help="从这个 checkpoint 继续训练（.zip 可省），比如 lf2_ppo.zip。"
-             "超参随 checkpoint 恢复；--timesteps 表示**追加**的步数。"
-             "观测/动作/奖励必须与训练时一致，否则加载或训练会直接报错。",
-    )
-    parser.add_argument(
-        "--ent-coef",
-        type=float,
-        default=None,
-        metavar="C",
-        help="熵正则系数（不给 = 沿用代码里的 0.01 / checkpoint 里存的值）。"
-             "注意：--resume 时超参是从 checkpoint 恢复的，改代码里的默认值没用，"
-             "必须用这个开关（它在 PPO.load 之后覆盖）才会生效。",
-    )
-    # 下面三个原来是纯环境变量（LF2_TIMESTEPS / LF2_SAVE_DIR / LF2_FINAL_PATH）。
-    # 环境变量在 cmd.exe 里写法不同、也容易忘，所以加一份等价的命令行参数：
-    # 传了就覆盖环境变量，不传就完全沿用原来的默认值。
-    parser.add_argument(
-        "--timesteps", type=int, default=None, metavar="N",
-        help="本次训练追加多少步（默认 1200000，可用 LF2_TIMESTEPS 覆盖）。"
-             "续训时这是**追加**步数，不是累计。",
-    )
-    parser.add_argument(
-        "--save-dir", default=None, metavar="DIR",
-        help="checkpoint 目录（默认 checkpoints，可用 LF2_SAVE_DIR 覆盖）。"
-             "训练新的一轮时务必换个目录，否则会同名覆盖掉旧 checkpoint。",
-    )
-    parser.add_argument(
-        "--final-path", default=None, metavar="PATH",
-        help="训练结束时存的模型路径（默认 lf2_ppo，可用 LF2_FINAL_PATH 覆盖）。",
-    )
-    return parser.parse_args(argv)
-
-
-if __name__ == "__main__":
-    _args = _parse_args()
-
-    # 命令行参数覆盖模块级常量（这里是模块作用域，直接赋值即可）。
-    # 必须在 main() 之前：main() 靠名字取这些全局量。
-    if _args.timesteps is not None:
-        TOTAL_TIMESTEPS = _args.timesteps
-    if _args.save_dir:
-        SAVE_DIR = _args.save_dir
-        # BEST_PATH 的默认值是 SAVE_DIR/best_model；用户没显式给 LF2_BEST_PATH 时跟着走，
-        # 否则 best_model.zip 还会写进旧目录。
-        if "LF2_BEST_PATH" not in os.environ:
-            BEST_PATH = os.path.join(SAVE_DIR, "best_model")
-    if _args.final_path:
-        FINAL_PATH = _args.final_path
-
-    print(f"[配置] 追加步数={TOTAL_TIMESTEPS}  checkpoint 目录={SAVE_DIR}  "
-          f"最终模型={FINAL_PATH}.zip  最优模型={BEST_PATH}.zip")
-
-    main(diff=_args.diff, resume=_args.resume,
-         seed_base=_args.seed_base, bg=_args.bg, ent_coef=_args.ent_coef)
+if __name__ == '__main__':
+    main(parse_args())

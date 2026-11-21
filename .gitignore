@@ -3,9 +3,11 @@ __pycache__/
 .claude/
 logs/
 logs_smoke/
+/runs/
 *.zip
 checkpoints/
 *.txt
+!lf2-rl/requirements.txt
 dqn_bench.py
 smoke_dqn.py
 smoke_ppo_best.py
