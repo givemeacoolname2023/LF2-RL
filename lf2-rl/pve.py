@@ -33,15 +33,16 @@ import sys
 import time
 
 import websockets
+from stable_baselines3 import PPO
 
+from action_selector import ACTION_MODES, ActionSelector, action_mode
 from env import ACTION_KEYS, state_to_obs
-from eval import (build_policy, detect_algo, latest_checkpoint,
-                  latest_dqn_checkpoint, resolve_model, ws_port_busy)
+from eval import latest_checkpoint, resolve_model
 
 WS_PORT = 8765
 
 
-async def serve(model, heartbeat, deterministic=True):
+async def serve(model, heartbeat, action_repeat=1, mode='greedy'):
     """每收到一帧状态就当场算动作并回发。事件驱动，不轮询。"""
     # 只认最新的连接：页面刷新后旧连接可能还在关，别让它继续吃动作
     active = {'ws': None}
@@ -49,6 +50,9 @@ async def serve(model, heartbeat, deterministic=True):
 
     async def handler(ws):
         active['ws'] = ws
+        selector = ActionSelector(model, mode)
+        last_action_at = None
+        session = None
         print('游戏已连接！')
         try:
             async for message in ws:
@@ -61,9 +65,18 @@ async def serve(model, heartbeat, deterministic=True):
                 # 只处理真正的对局状态；其它消息（没有 davis/dennis）直接忽略
                 if 'davis' not in state or 'dennis' not in state:
                     continue
+                frame = state['time']
+                if state.get('session') != session or (last_action_at is not None and frame < last_action_at):
+                    selector.reset()
+                    last_action_at = None
+                    session = state.get('session')
+                frames = action_repeat if last_action_at is None else frame - last_action_at
+                if frames < action_repeat:
+                    continue
+                last_action_at = frame
 
                 obs = state_to_obs(state)
-                action = int(model.predict(obs, deterministic=deterministic)[0])
+                action = int(selector.predict(obs, frames))
                 await ws.send(json.dumps({
                     'action': action,
                     'keys': ACTION_KEYS[action],
@@ -90,61 +103,40 @@ def main():
     parser = argparse.ArgumentParser(
         description='真人对模型：模型操控左边的 Davis，你用键盘操控右边的 Dennis')
     parser.add_argument('--model', default=None,
-                        help='模型路径，.zip / .pt 后缀可省；默认按 --algo 取 checkpoints/ 下的模型')
-    parser.add_argument('--algo', choices=('auto', 'ppo', 'dqn'), default='auto',
-                        help='ppo 读 .zip，dqn 读 .pt；auto 按扩展名判断（默认）')
+                        help='PPO 模型路径（.zip 可省）')
+    parser.add_argument('--algo', choices=('ppo',), help=argparse.SUPPRESS)
     parser.add_argument('--device', default='cpu', help='推理设备（默认 cpu）')
     parser.add_argument('--heartbeat', type=float, default=2.0,
                         help='每隔几秒打印一次双方血量（0 = 不打印，默认 2）')
-    parser.add_argument('--stochastic', action='store_true',
-                        help='每帧从策略分布采样而不是取 argmax。默认是 argmax（和 '
-                             'eval.py 一致）。加上它是因为确定性策略一旦进了不动点 '
-                             '（蹲着不动、对着墙出拳），观测不变、动作也不变，会永远卡住；'
-                             '采样能打破这个循环。')
+    policy_args = parser.add_mutually_exclusive_group()
+    policy_args.add_argument('--action-mode', choices=ACTION_MODES, help='出招方式（默认沿用存档）')
+    policy_args.add_argument('--stochastic', dest='action_mode', action='store_const', const='sample',
+                             help='从策略分布采样动作')
     args = parser.parse_args()
 
-    # ---- 1. 找模型（PPO 的 .zip 和 DQN 的 .pt 都行）----
-    if args.model:
-        model_path = resolve_model(args.model)
-        if model_path is None:
-            print(f'[错误] 找不到模型：{args.model}')
-            return 1
-    elif args.algo == 'dqn':
-        model_path = latest_dqn_checkpoint()
-        if model_path is None:
-            print('[错误] checkpoints/ 下没有 .pt。先用 train_DQN.py 训练。')
-            return 1
-    else:
-        model_path = latest_checkpoint()
-        if model_path is None:
-            print('[错误] checkpoints/ 下没有 .zip。先用 train.py 训练，'
-                  '或改用 --model lf2_ppo.zip；要比 DQN 就加 --algo dqn')
-            return 1
-
-    algo = detect_algo(model_path) if args.algo == 'auto' else args.algo
-
-    # ---- 2. 端口预检 ----
-    if ws_port_busy():
-        print(f'[错误] 端口 {WS_PORT} 已被占用 —— train.py / eval.py 还开着？')
-        print('       先停掉它们（Ctrl+C），确认 netstat -ano | findstr :8765 没有输出。')
-        return 1
+    model_path = resolve_model(args.model) if args.model else latest_checkpoint()
+    if model_path is None:
+        parser.error(f'找不到 PPO .zip 模型（{args.model or "checkpoints/"}）。')
 
     # ---- 3. 加载模型（不需要 env，纯推理）----
     try:
-        model = build_policy(algo, model_path, device=args.device,
-                             stochastic=args.stochastic)
+        model = PPO.load(model_path, device=args.device)
     except Exception as e:
         print(f'[错误] 加载模型失败：{type(e).__name__}: {e}')
         return 1
-    print(f'[模型] {model_path}    [算法] {algo.upper()}')
-    print(f'[策略] {model.describe()}')
+    action_repeat = getattr(model, 'lf2_config', {}).get('action_repeat', 1)
+    mode = action_mode(model, args.action_mode)
+    print(f'[模型] {model_path}    [算法] PPO    [动作重复] {action_repeat} 帧    [出招] {mode}')
     print('[键位] 你操作右边的 Dennis：U 上 / M 下 / H 左 / K 右 / I 跳 / , 防 / J 攻')
     print('[提示] 页面要用 ?pve 打开，并且浏览器要 --visible（画面得看得见）')
     print('[重启] 打完一局按 F5 重开，本脚本不用重启')
     print('[退出] Ctrl+C\n')
 
     try:
-        asyncio.run(serve(model, args.heartbeat, deterministic=not args.stochastic))
+        asyncio.run(serve(model, args.heartbeat, action_repeat, mode))
+    except OSError as exc:
+        print(f'[错误] WebSocket 端口 {WS_PORT} 无法使用：{exc}')
+        return 1
     except KeyboardInterrupt:
         print('\n[停止] 已退出')
     return 0

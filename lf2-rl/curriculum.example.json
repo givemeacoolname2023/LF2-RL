@@ -1,0 +1,31 @@
+{
+  "reward": {
+    "win": 1.0,
+    "loss": -1.0,
+    "draw": -1.0,
+    "timeout": -1.25,
+    "health_margin": 0.25,
+    "health_potential": 0.5,
+    "distance_potential": 0.08,
+    "depth_weight": 4.0,
+    "win_speed": 0.1,
+    "frame_cost": 0.0,
+    "distance_cost": 0.0
+  },
+  "stages": [
+    {
+      "difficulty": "easy",
+      "min_steps": 393216,
+      "max_steps": 786432,
+      "promote_win_rate": 0.7,
+      "reward": {"distance_potential": 0.12}
+    },
+    {
+      "difficulty": "normal",
+      "min_steps": 786432,
+      "max_steps": 1572864,
+      "promote_win_rate": 0.6
+    },
+    {"difficulty": "difficult"}
+  ]
+}

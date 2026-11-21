@@ -11,6 +11,7 @@ var rl_reloading = false;  // 防止重复 reload
 
 // Headless mode: ?headless 参数跳过 canvas 渲染，大幅提速
 var rl_headless = (window.location.search.indexOf('headless') !== -1);
+var rl_step_mode = new URLSearchParams(window.location.search).has('rlstep');
 
 // 把页面 URL 里的 diff / seed 换成指定值，用来响应 env.py 的切换难度 / 换种子请求。
 // 只改指定的那个 token：不能用 URLSearchParams，因为它会输出 debug= / headless=，
@@ -65,32 +66,58 @@ var ACTION_MAP = [
   ['right', 'up'],           // 15: 右+纵深向上
 ];
 
-function rl_inject_action(action) {
+function rl_combat_keys(action, match, player) {
+  const agent = match?.rl_characters?.[player]
+  const opponent = match?.rl_characters?.[1 - player]
+  if (!opponent) return []
+  const delta_x = opponent.ps.x - agent.ps.x
+  const delta_z = opponent.ps.z - agent.ps.z
+  const toward = delta_x < 0 ? 'left' : 'right'
+  switch (action) {
+    case 16: return ['def', toward, 'att']
+    case 17: return agent.id === 4 ? ['def', toward, 'jump'] : [toward, 'def', 'down', 'att']
+    case 18: return agent.id === 4 ? [toward, 'def', 'jump', 'att'] : [toward, 'def', 'up', 'att']
+    case 19: return [toward, 'def', 'up', 'jump']
+    case 20: {
+      const keys = []
+      if (Math.abs(delta_x) > 30) keys.push(toward)
+      if (Math.abs(delta_z) > 4) keys.push(delta_z < 0 ? 'up' : 'down')
+      return keys
+    }
+    case 21: return [toward, 'att']
+    default: return []
+  }
+}
+
+function rl_inject_action(action, match, player = 0) {
   // 触屏控制器没有 buf，直接跳过，避免每帧抛异常把整个游戏循环卡死
-  if (!rl_controller || !rl_controller.buf) return;
+  var controller = player === 1 ? match.rl_characters[1].con : (match?.simulation ? match.rl_controller : rl_controller);
+  if (!controller || !controller.buf) return;
   // 只有训练端（env.py）连着时才注入。注入的「全键抬起」会清掉玩家按住的方向键
   // （角色的移动/连招读的是 con.state 电平，见 LF/character.js 与 core/combodec.js），
   // 没有训练连接时完全不干预，手动玩的手感与官方页面一致。
-  if (!rl_ws || rl_ws.readyState !== 1) return;
+  if (!rl_step_mode && (!rl_ws || rl_ws.readyState !== 1)) return;
   // 比赛已结束：不再注入。注入的 att/jump 会经 controller.child 传到 match.key，
   // 在 gameover 状态下触发 F4() 退回主菜单，导致训练端再也收不到状态。
-  if (typeof rl_match !== 'undefined' && rl_match && rl_match.gameover_state) return;
-  var keys = ACTION_MAP[action] || [];
+  var active = match || window.rl_match;
+  if (active && active.gameover_state) return;
+  var keys = ACTION_MAP[action] || rl_combat_keys(action, active, player);
   var all_keys = ['left', 'right', 'up', 'down', 'jump', 'att', 'def'];
 
   // 正确方式：往 buf 里 push 事件，fetch() 时才会被游戏读到
   // 先 push 所有键的 up 事件（清除之前的状态）
   for (var i = 0; i < all_keys.length; i++) {
-    rl_controller.buf.push([all_keys[i], 0]);
+    controller.buf.push([all_keys[i], 0]);
   }
   // 再 push 当前动作的 down 事件
   for (var i = 0; i < keys.length; i++) {
-    rl_controller.buf.push([keys[i], 1]);
+    controller.buf.push([keys[i], 1]);
   }
 }
 
 
 (function () {
+  if (rl_step_mode) return;
   function connect() {
     rl_ws = new WebSocket('ws://localhost:8765');
     rl_ws.onopen = function () { console.log('RL bridge connected'); };
@@ -137,7 +164,7 @@ function rl_inject_action(action) {
 // 保活：持有 Web Lock 的页面不会被浏览器的 Page Lifecycle 冻结。
 // 这只能防止“冻结”，后台标签页的定时器降频仍需浏览器参数配合
 // （见 lf2-rl/launch_browser.py 的 --disable-background-timer-throttling）。
-if (navigator.locks && navigator.locks.request) {
+if (!rl_step_mode && navigator.locks && navigator.locks.request) {
   navigator.locks.request('lf2_rl_keepalive', function () {
     return new Promise(function () { /* 永不 resolve，锁一直持有 */ });
   });
@@ -174,6 +201,7 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
       $.manager = config.manager
       $.state = config.state
       $.data = config.package.data
+      $.simulation = config.simulation
       $.sound = config.manager.sound
       $.spec = $.data.properties.data
       $.time
@@ -181,14 +209,14 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
 
     match.prototype.create = function (setting) {
       const $ = this
-      window.rl_match = $   // RL: 供 rl_inject_action 判断比赛是否已结束
+      if (!$.simulation) window.rl_match = $
       let object_ids = []
       const AI_ids = []
       for (var i = 0; i < setting.player.length; i++) {
         // (lazy) now load all characters and associated data files
         object_ids.push(setting.player[i].id)
         object_ids = object_ids.concat(Futil.extract_array(util.select_from($.data.object, { id: setting.player[i].id }).pack, 'id').id)
-        for (index in $.data.object) {
+        for (const index in $.data.object) {
           if ($.data.object[index].id == setting.player[i].id && $.data.object[index].AI) {
             AI_ids.push($.data.object[index].AI)
           }
@@ -232,9 +260,16 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
           // $.create_characters(setting.player, { pane: true })
           $.create_characters(setting.player, { pane: true })
           // 设置 RL controller（Player 0 = Davis）
-          var char_keys = Object.keys($.character);
-          if (char_keys.length > 0) {
-            rl_controller = $.character[char_keys[0]].con;
+          const characters = Object.values($.character)
+          $.rl_characters = characters
+          if ($.simulation || rl_step_mode) {
+            $.rl_damage = 0
+            $.rl_center_damage = 0
+          }
+          if ($.simulation) {
+            $.rl_controller = characters[0].con
+          } else if (characters.length > 0) {
+            rl_controller = characters[0].con
           }
 
 
@@ -246,8 +281,12 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
           $.drop_weapons(setting.set.weapon)
         }
 
-        Fsprite.masterconfig_set('onready', onready)
-        setTimeout(function () { onready() }, 8000) // assume it is ready after 8 seconds
+        if (rl_step_mode) {
+          onready()
+        } else {
+          Fsprite.masterconfig_set('onready', onready)
+          setTimeout(function () { onready() }, 8000) // assume it is ready after 8 seconds
+        }
       })
       function onready() {
         if (!already) { // all loading finished
@@ -268,7 +307,7 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
       const $ = this
       $.time.paused = true
       $.destroyed = true
-      network.clearInterval($.time.timer)
+      if ($.time.timer !== null) network.clearInterval($.time.timer)
 
       // destroy all objects
       $.for_all('destroy')
@@ -361,17 +400,41 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
         t: 0,
         paused: false,
         timer: null,
-        $fps: util.div('fps')
+        $fps: rl_step_mode ? null : util.div('fps')
       }
       if (!$.time.$fps) $.calculate_fps = function () { }
-      $.time.timer = network.setInterval(function () { return $.frame() }, 1000 / Global.gameplay.framerate / 1.5)
+      if (!rl_step_mode) {
+        $.time.timer = network.setInterval(function () { return $.frame() }, 1000 / Global.gameplay.framerate / 1.5)
+      }
+    }
+
+    match.prototype.rl_step = function (action, frames, opponent_action = null) {
+      this.rl_opponent_action = opponent_action
+      if (this.simulation) {
+        this.rl_action = action
+        for (let index = 0; index < frames && !this.gameover_state; index++) this.frame()
+        return
+      }
+      rl_action = action
+      let state
+      for (let index = 0; index < frames; index++) {
+        state = this.frame()
+        if (state.davis.hp <= 0 || state.dennis.hp <= 0) break
+      }
+      return state
     }
 
     match.prototype.frame = function () {
       const $ = this
+      const [agent, opponent] = $.rl_damage === undefined ? [] : $.rl_characters
+      const previous_hp = opponent && Math.max(0, opponent.health.hp)
       // 每帧在 fetch 之前注入动作，保证攻击键被正确检测
       // 只在训练端连着时注入（否则连调试日志也会刷屏，且会干扰手动操作）
-      if (rl_controller && rl_ws && rl_ws.readyState === 1) {
+      if ($.simulation) {
+        rl_inject_action($.rl_action, $)
+      } else if (rl_step_mode) {
+        rl_inject_action(rl_action)
+      } else if (rl_controller && rl_ws && rl_ws.readyState === 1) {
         rl_inject_action(rl_action)
         // 每30帧打印一次调试信息
         if ($.time.t % 30 === 0) {
@@ -390,6 +453,9 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
           }
         }
       }
+      if (($.simulation || rl_step_mode) && $.rl_opponent_action != null) {
+        rl_inject_action($.rl_opponent_action, $, 1)
+      }
       if ($.control) { $.control.fetch() }
       if (!$.time.paused || $.time.paused === 'F2') {
         for (const i in $.character) {
@@ -400,7 +466,7 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
           return
         }
         // RL controller 자동 설정
-        if (!rl_controller) {
+        if (!$.simulation && !rl_controller) {
           for (var k in $.character) {
             // if ($.character[k].data.id === 11) {
             if ($.character[k].data.bmp.name === 'Davis') {
@@ -412,6 +478,16 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
         }
 
         $.TU_trans()
+        if (opponent) {
+          const damage = previous_hp - Math.max(0, opponent.health.hp)
+          if (damage > 0) {
+            const width = $.background.width
+            const midpoint = (agent.ps.x + opponent.ps.x) / 2
+            const distance = Math.min(1, Math.abs(midpoint - width / 2) / (width / 2))
+            $.rl_damage += damage
+            $.rl_center_damage += damage * (1 - distance ** 2)
+          }
+        }
         if ($.time.t === 0) {
           $.match_event('start')
         }
@@ -428,6 +504,7 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
         }
       }
       // return $.game_state()
+      if ($.simulation) return
       const state = $.game_state()
       if (rl_ws && rl_ws.readyState === 1 && state) {
         rl_ws.send(JSON.stringify(state))
@@ -474,7 +551,7 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
       if (chars.length < 2) return null
 
       // 第一帧打印所有角色名字，方便调试
-      if ($.time.t === 1) {
+      if (!rl_step_mode && $.time.t === 1) {
         chars.forEach(function (c) {
           console.log('角色 bmp.name:', c.data.bmp.name, '| team:', c.team)
         })
@@ -500,12 +577,16 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
         // 本局的背景场地在 bg_list 里的下标（?bg= 可钉住）；各场地宽度差 4 倍，
         // 观测缩放只对 ~800 宽的场地成立，所以评估时必须记录/校验它
         bg: window.rl_bg,
+        damage: $.rl_damage,
+        center_damage: $.rl_center_damage,
         davis: {
+          character: davis.data.bmp.name,
           x: davis.ps.x, y: davis.ps.y, z: davis.ps.z,
           hp: davis.health.hp, mp: davis.health.mp,
           frame: davis.frame.N, dir: davis.ps.dir
         },
         dennis: {
+          character: dennis.data.bmp.name,
           x: dennis.ps.x, y: dennis.ps.y, z: dennis.ps.z,
           hp: dennis.health.hp, mp: dennis.health.mp,
           frame: dennis.frame.N, dir: dennis.ps.dir
@@ -522,6 +603,7 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
       $.sound.TU()
       $.show_hp()
       $.check_gameover()
+      if (rl_step_mode && $.gameover_state) return
       const AI_frameskip = 3 // AI script runs at a lower framerate, and is still very reactive
       if ($.time.t % AI_frameskip === 0) {
         for (let i = 0; i < $.AIscript.length; i++) {
@@ -840,6 +922,10 @@ define(['core/util', 'core/controller', 'LF/sprite-select',
 
     match.prototype.check_gameover = function () {
       const $ = this
+      if ($.simulation) {
+        if ($.rl_characters.some(character => character.health.hp <= 0)) $.gameover_state = true
+        return
+      }
       const teams = {}
       if (!$.panel) {
         return

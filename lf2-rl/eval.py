@@ -1,518 +1,192 @@
-"""
-eval.py —— 用训好的模型（PPO 或 DQN）打 N 局，统计胜率和行为特征。
-
-为什么需要它：
-    train.py 只打 ep_rew_mean，而那个指标会被「距离奖励」灌水 ——
-    模型站在中距离不动也能拿 400 多分，看起来"在学"，其实一招没出。
-    这个脚本直接数四件事：赢没赢、出没出招、站多远、纵深对不对齐。这几个数骗不了人。
-
-随机策略的对照基线：动作里含 att 的有 5 个（总数随 ACTION_KEYS 变化），
-所以随机出招占比约三成（16 个动作时 5/16 ≈ 31%）。
-模型如果远低于这个数，说明它学的是「别打」，而不是「怎么打」。
-
-另外统计纵深：平均 |dz| 和「纵深对齐率」（|dz| <= 12px，即命中所需的 zwidth）。
-只对得上 x 对不上 z 的话，画面里看起来贴脸，实际一拳都打不中。
-
-用法（需要 serve.py + launch_browser.py 已启动，且 train.py 已停止 —— 8765 独占）：
-    python eval.py                                      # 默认跑 checkpoints 里最新的模型，20 局
-    python eval.py --model lf2_ppo.zip --episodes 50     # 跑指定的模型
-    set LF2_MAX_STEPS=400 && python eval.py --episodes 2 # 短局冒烟，几分钟跑完
-
-    
-评估可视化
-# 终端 A（serve.py）—— 全程不用管，一直在跑
-# 终端 B
-python launch_browser.py --port 8010 --visible --path "/LF2-RL/game/game.html?debug"
-# 终端 C
-python eval.py --episodes 1
-
-不做的事：
-    不修改 env.py / train.py，只读地用它们。模型是 deterministic 选动作（不打采样噪声），
-    这样同一局条件固定时结果可复现。
-"""
+"""Evaluate a PPO checkpoint on reproducible LF2 matches."""
 
 import argparse
-import glob
-import json
-import os
-import re
-import socket
-import sys
-import time
 from collections import Counter
+from contextlib import ExitStack
+import json
+from pathlib import Path
+import re
+import time
 
-import numpy as np
+from stable_baselines3 import PPO
 import torch
 
-from env import (ACTION_KEYS, DIFF_NAMES, LF2Env, OBS_SCALE,
-                 diff_arg, resolve_diff)
-
-# 观测下标 / 出招判定 / Wilson CI 统一定义在 rl_metrics.py，
-# 因为 train_DQN.py 的 evaluate() 也要用同一套口径，两边不能各写一份。
-from rl_metrics import (        # noqa: F401 —— 这些名字仍然是 eval.py 的公开属性
-    ATTACK_ACTIONS, IDX_D_HP, IDX_DX, IDX_E_HP,
-    RANDOM_ATTACK_RATE, action_name, depth_aligned, dz_px, wilson,
-)
-
-WS_PORT = 8765
-
-
-
-def ws_port_busy(port=WS_PORT):
-    """8765 有没有人占着。
-
-    不能用 connect 探测：env.py 的 _handler 会把每一个新连接都当成游戏页面
-    （`self.ws = websocket`），我们的探测会把正在训练的进程挤掉一次。
-    这里只是试 bind，不设 SO_REUSEADDR —— Windows 下端口处于 LISTEN 时
-    bind 会失败，够用了。
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.bind(('127.0.0.1', port))
-        return False
-    except OSError:
-        return True
-    finally:
-        s.close()
+from action_selector import ACTION_MODES, ActionSelector, action_mode
+from env import DIFF_NAMES, OBS_SCALE, POLICY_CHARACTERS, diff_arg, resolve_diff
+from rl_metrics import (IDX_D_HP, IDX_E_HP, action_name,
+                        depth_aligned, dist_px, dz_px, is_attack, wilson)
+from sync_env import DEFAULT_ASSETS, DEFAULT_MAX_FRAMES, DEFAULT_SEED, SyncLF2Env, game_server
 
 
 def resolve_model(path):
-    """把 --model 补成真实存在的路径；找不到返回 None。.zip（PPO）和 .pt（DQN）都试。"""
-    for cand in (path, path + '.zip', path + '.pt'):
-        if os.path.isfile(cand):
-            return cand
-    return None
+    path = Path(path)
+    if path.suffix != '.zip':
+        path = Path(f'{path}.zip')
+    return str(path) if path.is_file() else None
 
 
 def latest_checkpoint(folder='checkpoints'):
-    """PPO：优先 checkpoints/best_model.zip，否则取步数最大的 .zip，找不到返回 None。
-
-    和 latest_dqn_checkpoint() 的优先级保持一致 —— 训练中贪婪评估胜率最高的那个，
-    才是报告里要引用的模型；最后那个 lf2_ppo.zip 只代表「跑完了」，不代表「最好」。
-    """
-    preferred = os.path.join(folder, 'best_model.zip')
-    if os.path.isfile(preferred):
+    folder = Path(folder)
+    preferred = resolve_model(folder / 'best_model.zip')
+    if preferred:
         return preferred
-    best, best_step = None, -1
-    for f in glob.glob(os.path.join(folder, '*.zip')):
-        m = re.search(r'_(\d+)_steps', os.path.basename(f))
-        step = int(m.group(1)) if m else 0
-        if step > best_step:
-            best, best_step = f, step
-    return best
+    candidates = []
+    for path in folder.glob('ppo_*_steps.zip'):
+        match = re.fullmatch(r'ppo_(\d+)_steps', path.stem)
+        if match:
+            candidates.append((int(match[1]), str(path)))
+    return max(candidates)[1] if candidates else resolve_model('lf2_ppo.zip')
 
 
-def latest_dqn_checkpoint(folder='checkpoints'):
-    """DQN：按「最可能想要」的顺序挑一个 .pt，找不到返回 None。
-
-    best_model.pt 是评估胜率最高那次的裸 state_dict，报告里引用的一般就是它；
-    没有的话退到 final_model.pt / last.pt，再退到 ep{N}.pt 里 N 最大的，
-    最后才按 mtime 取最新的 .pt（例如 interrupted.pt）。
-    """
-    for name in ('best_model.pt', 'final_model.pt', 'last.pt', 'interrupted.pt'):
-        p = os.path.join(folder, name)
-        if os.path.isfile(p):
-            return p
-
-    best, best_n = None, -1
-    for f in glob.glob(os.path.join(folder, 'ep*.pt')):
-        m = re.search(r'ep(\d+)\.pt$', os.path.basename(f))
-        if m and int(m.group(1)) > best_n:
-            best, best_n = f, int(m.group(1))
-    if best:
-        return best
-
-    pts = glob.glob(os.path.join(folder, '*.pt'))
-    return max(pts, key=os.path.getmtime) if pts else None
-
-
-def detect_algo(model_path):
-    """按扩展名猜算法：.pt → dqn，其余（.zip）→ ppo。"""
-    return 'dqn' if model_path.lower().endswith('.pt') else 'ppo'
-
-
-class QNetworkPolicy:
-    """把 DQN 的 .pt 包成和 SB3 的 model.predict() 一样的接口。
-
-    这样下面「跑 N 局统计」那段代码一行都不用改，PPO 和 DQN 的评估口径天然一致。
-    """
-
-    def __init__(self, model_path, device='cpu', stochastic=False, temperature=1.0):
-        # 延迟导入：只在真的要评 DQN 时才拖进 torch 训练模块
-        from train_DQN import ACT_DIM, OBS_DIM, QNetwork, load_checkpoint
-
-        self.device = torch.device(device)
-        self.stochastic = stochastic
-        self.temperature = max(1e-6, float(temperature))
-
-        ckpt = load_checkpoint(model_path, device=self.device)
-        cfg = ckpt.get('config') or {}
-        obs_dim = int(cfg.get('obs_dim', OBS_DIM))
-        act_dim = int(cfg.get('act_dim', ACT_DIM))
-
-        self.net = QNetwork(obs_dim, act_dim).to(self.device)
-        self.net.load_state_dict(ckpt['model'])
-        self.net.eval()
-
-        self.meta = {'algo': 'dqn', 'format': ckpt.get('format'),
-                     'episode': ckpt.get('episode'), 'total_steps': ckpt.get('total_steps'),
-                     'best_win_rate': ckpt.get('best_win_rate')}
-
-    def predict(self, obs, deterministic=True):
-        with torch.no_grad():
-            q = self.net(torch.as_tensor(np.asarray(obs), dtype=torch.float32)
-                         .unsqueeze(0).to(self.device))[0]
-        if deterministic or not self.stochastic:
-            return int(q.argmax().item()), None
-        # DQN 没有可采样的策略分布，这里用 softmax(Q/T) 近似 —— 它测的是
-        # 「argmax 策略有多脆」，不能和 PPO 的「按策略分布采样」当同一个口径比。
-        probs = torch.softmax(q / self.temperature, dim=-1)
-        return int(torch.multinomial(probs, 1).item()), None
-
-    def describe(self):
-        """一句话说明这个模型是怎么选动作的。"""
-        if self.stochastic:
-            return f'DQN softmax(Q/{self.temperature:g}) 采样'
-        return 'DQN argmax deterministic'
-
-
-class PPOPolicy:
-    """薄包装，让 PPO 也被传进来的 env 一致地处理（保持原有行为）。"""
-
-    def __init__(self, model_path, env=None, device='cpu', stochastic=False):
-        from stable_baselines3 import PPO
-        self.model = PPO.load(model_path, env=env, device=device)
-        self.stochastic = stochastic
-        self.meta = {'algo': 'ppo'}
-
-    def predict(self, obs, deterministic=True):
-        action, _ = self.model.predict(obs, deterministic=deterministic)
-        return int(action), None
-
-    def describe(self):
-        return ('PPO 采样 stochastic' if self.stochastic
-                else 'PPO argmax deterministic')
-
-
-def build_policy(algo, model_path, env=None, device='cpu', stochastic=False,
-                 temperature=1.0):
-    if algo == 'dqn':
-        return QNetworkPolicy(model_path, device=device,
-                              stochastic=stochastic, temperature=temperature)
-    return PPOPolicy(model_path, env=env, device=device, stochastic=stochastic)
-
-
-def _ensure_utf8_stdout():
-    """重定向到文件 / 管道时 Windows 会用 GBK 编码 stdout，中文和 emoji 会抛
-    UnicodeEncodeError。训练和评估都跑很久，输出一般都要存盘，先修好。"""
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding='utf-8', errors='replace')
-        except Exception:                       # noqa: BLE001
-            pass
-
-
-def fmt_eta(seconds):
-    seconds = int(seconds)
-    if seconds < 60:
-        return f'{seconds} 秒'
-    return f'{seconds // 60} 分 {seconds % 60} 秒'
+def evaluate_episode(env, selector, seed):
+    obs, _ = env.reset(seed=seed)
+    selector.reset()
+    start_hp = obs[[IDX_D_HP, IDX_E_HP]] * OBS_SCALE[[IDX_D_HP, IDX_E_HP]]
+    action_counts = Counter()
+    steps = attacks = aligned = 0
+    distance = depth = 0.0
+    while True:
+        action = int(selector.predict(obs, env.action_repeat))
+        action_counts[action] += 1
+        attacks += is_attack(action, env.character)
+        obs, _, terminated, truncated, info = env.step(action)
+        steps += 1
+        distance += dist_px(obs)
+        depth += dz_px(obs)
+        aligned += depth_aligned(obs)
+        if terminated or truncated:
+            break
+    end_hp = obs[[IDX_D_HP, IDX_E_HP]] * OBS_SCALE[[IDX_D_HP, IDX_E_HP]]
+    record = {
+        'seed': seed, 'bg': env.observed_bg, 'result': info['result'],
+        'center_damage_ratio': info['center_damage_ratio'], 'center_win': info['center_win'],
+        'steps': steps, 'frames': info['game_frames'], 'attacks': attacks,
+        'mean_dist': distance / steps, 'mean_dz': depth / steps, 'align_rate': aligned / steps,
+        'dealt': float(max(0, start_hp[1] - max(0, end_hp[1]))),
+        'taken': float(max(0, start_hp[0] - max(0, end_hp[0]))),
+    }
+    return record, action_counts
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='用训好的模型（PPO 或 DQN）打 N 局，统计胜率与行为特征')
-    parser.add_argument('--model', default=None,
-                        help='模型路径，.zip / .pt 后缀可省；'
-                             '默认按 --algo 取 checkpoints/ 下的模型')
-    parser.add_argument('--algo', choices=('auto', 'ppo', 'dqn'), default='auto',
-                        help='ppo 读 .zip，dqn 读 .pt；auto 按扩展名判断（默认）')
-    parser.add_argument('--episodes', type=int, default=20, help='跑几局（默认 20）')
-    parser.add_argument('--device', default='cpu', help='推理设备（默认 cpu，16 维 MLP 用不上 GPU）')
-    parser.add_argument('--stochastic', action='store_true',
-                        help='按策略分布采样选动作，而不是取 argmax。'
-                             '默认 deterministic：每局几乎一模一样，20 局约等于同一条轨迹跑 20 遍；'
-                             '加这个开关才看得出策略的真实方差（也要用它才能和训练时的表现对比）。'
-                             'DQN 没有可采样的分布，用 softmax(Q/温度) 代替。')
-    parser.add_argument('--temperature', type=float, default=1.0,
-                        help='仅 DQN 的 --stochastic 用：softmax(Q/T) 的温度（默认 1.0）')
-    parser.add_argument('--seed-base', type=int, default=10000,
-                        help='每局随机种子的基准：第 i 局（从 0 起）用 seed_base+i，'
-                             '让每局开局不同、但整组可复现（默认 10000）。'
-                             '传负数 = 关闭，沿用页面里写死的固定种子 824163532（老行为）。')
-    parser.add_argument('--bg', type=int, default=None, metavar='INDEX',
-                        help='钉住背景场地（bg_list 下标 0–8）。不给 = 沿用页面原来的随机选择。'
-                             '各场地宽度 794~3200 差 4 倍，而观测缩放只对 ~800 宽成立，'
-                             '所以「换开局」的评估必须固定场地，否则换 seed 等于换游戏。')
-    parser.add_argument('--diff', type=diff_arg,
-                        choices=('easy', 'normal', 'difficult'), default=None,
-                        help='对手难度，可写 easy / normal / difficult 或 0 / 1 / 2；'
-                             '不给则沿用页面 URL 里的设置（旧行为）。'
-                             '指定后 env.py 会切换已打开的浏览器并校验，'
-                             '切不过去会直接报错，绝不评估错难度的对手。')
-    parser.add_argument('--json', default=None, metavar='PATH',
-                        help='把汇总结果另存为 JSON（写报告时引用）')
+    parser = argparse.ArgumentParser(description='评估 PPO 模型的胜率与行为特征')
+    parser.add_argument('--model', help='PPO 模型路径（.zip 可省）')
+    parser.add_argument('--character', choices=POLICY_CHARACTERS, help='主队角色（默认沿用存档）')
+    parser.add_argument('--opponent-model', help='客队 PPO 模型路径（.zip 可省，默认对战 Dennis AI）')
+    parser.add_argument('--algo', choices=('ppo',), help=argparse.SUPPRESS)
+    parser.add_argument('--episodes', type=int, default=20)
+    parser.add_argument('--device', default='cpu')
+    policy_args = parser.add_mutually_exclusive_group()
+    policy_args.add_argument('--action-mode', choices=ACTION_MODES, help='出招方式（默认沿用存档）')
+    policy_args.add_argument('--stochastic', dest='action_mode', action='store_const', const='sample',
+                             help='从策略分布采样动作')
+    parser.add_argument('--seed-base', type=int, default=20000, help='种子起点。-1 每局使用同一个默认种子。')
+    parser.add_argument('--diff', type=diff_arg)
+    parser.add_argument('--bg', type=int, choices=range(9))
+    parser.add_argument('--action-repeat', type=int)
+    parser.add_argument('--max-frames', type=int)
+    parser.add_argument('--assets', type=Path, default=DEFAULT_ASSETS)
+    parser.add_argument('--browser')
+    parser.add_argument('--json', type=Path, metavar='PATH')
     args = parser.parse_args()
-    _ensure_utf8_stdout()
+    if args.episodes < 1 or not -1 <= args.seed_base <= 2 ** 32 - args.episodes:
+        parser.error('局数须为正数，种子范围须在无符号 32 位整数内。')
+    model_path = resolve_model(args.model) if args.model else latest_checkpoint()
+    if model_path is None:
+        parser.error(f'找不到 PPO .zip 模型（{args.model or "checkpoints/"}）。')
+    opponent_path = resolve_model(args.opponent_model) if args.opponent_model else None
+    if args.opponent_model and opponent_path is None:
+        parser.error(f'找不到对手 PPO .zip 模型（{args.opponent_model}）。')
 
-    # ---- 1. 找模型 ----
-    if args.model:
-        model_path = resolve_model(args.model)
-        if model_path is None:
-            print(f'[错误] 找不到模型：{args.model}')
-            return 1
-    elif args.algo == 'dqn':
-        model_path = latest_dqn_checkpoint()
-        if model_path is None:
-            print('[错误] checkpoints/ 下没有 .pt。先用 train_DQN.py 训练。')
-            return 1
-    else:
-        model_path = latest_checkpoint()
-        if model_path is None:
-            print('[错误] checkpoints/ 下没有 .zip。先用 train.py 训练，'
-                  '或改用 --model lf2_ppo.zip；要评 DQN 就加 --algo dqn')
-            return 1
-
-    algo = detect_algo(model_path) if args.algo == 'auto' else args.algo
-    if args.algo != 'auto' and detect_algo(model_path) != args.algo:
-        print(f'[提示] --algo {args.algo} 但文件是 {model_path}，按 --algo 处理。')
-
-    # ---- 2. 端口预检（抢不到 8765 会表现成"等 120 秒后超时"，很难排查）----
-    if ws_port_busy():
-        print(f'[错误] 端口 {WS_PORT} 已被占用 —— 多半是 train.py 还在跑。')
-        print('       env.py 把训练端口写死在 8765，两边的对局会互相抢。')
-        print('       先把训练停掉（Ctrl+C），确认 netstat -ano | findstr :8765 没有输出，再运行本脚本。')
-        return 1
-
-    print(f'[模型] {model_path}    [算法] {algo.upper()}')
-    print(f'[局数] {args.episodes}    [设备] {args.device}')
-    if args.diff:
-        diff_level = resolve_diff(args.diff)
-        diff_msg = (f'请求 {DIFF_NAMES[diff_level]}（diff={diff_level}），'
-                    f'env.py 会切换并校验')
-    else:
-        diff_msg = '未指定 --diff，沿用页面 URL 里的设置'
-    print(f'[难度] {diff_msg}')
-    print(f'[提示] 需要 serve.py + 浏览器页面已打开；一局约 45~65 秒。')
-    print()
-
-    # ---- 3. 建环境和模型（只能建一个 LF2Env，8765 写死了）----
-    seed_base = None if args.seed_base < 0 else int(args.seed_base)
-    if seed_base is None:
-        print('[种子] 已关闭（所有局共用页面里写死的 824163532，结果不可当独立样本）')
-    else:
-        print(f'[种子] base={seed_base}，第 i 局用 seed={seed_base}+i（i 从 0 起）')
-    if args.bg is not None:
-        print(f'[场地] 固定 bg={args.bg}（不固定的话换 seed 会连场地一起换掉）')
-    try:
-        env = LF2Env(diff=args.diff, seed_base=seed_base, bg=args.bg)
-    except Exception as e:
-        print(f'[错误] 创建环境失败：{e}')
-        return 1
-    try:
-        model = build_policy(algo, model_path, env=env, device=args.device,
-                             stochastic=args.stochastic, temperature=args.temperature)
-    except Exception as e:
-        print(f'[错误] 加载模型失败：{type(e).__name__}: {e}')
-        env.close()
-        return 1
-
-    print(f'[选动作] {model.describe()}')
-    meta = getattr(model, 'meta', {}) or {}
-    if algo == 'dqn' and meta.get('episode') is not None:
-        print(f'[检查点] ep={meta.get("episode")}  steps={meta.get("total_steps")}  '
-              f'best_win_rate={meta.get("best_win_rate")}')
-    print()
-
+    torch.set_num_threads(1)
+    model = PPO.load(model_path, device=args.device)
+    opponent_model = PPO.load(opponent_path, device=args.device) if opponent_path else None
+    mode = action_mode(model, args.action_mode)
+    selector = ActionSelector(model, mode)
+    config = getattr(model, 'lf2_config', {})
+    character = args.character or config.get('character', 'davis')
+    bg = args.bg if args.bg is not None else config.get('bg', 0)
+    repeat = args.action_repeat if args.action_repeat is not None else config.get('action_repeat', 1)
+    max_frames = args.max_frames if args.max_frames is not None else config.get('max_frames', DEFAULT_MAX_FRAMES)
+    difficulty = resolve_diff(args.diff) if args.diff is not None else config.get('diff', 0)
     episodes = []
-    action_counter = Counter()
-    t_start = time.time()
-
-    try:
-        for ep in range(1, args.episodes + 1):
-            # 环境种子由 env.reset() 按局号算（seed_base + 局号），这里只固定「策略采样」的 RNG，
-            # 否则 --stochastic 下同一局重跑两次，动作序列还是不一样，谈不上可复现。
-            ep_seed = None if seed_base is None else seed_base + (ep - 1)
-            if ep_seed is not None:
-                torch.manual_seed(ep_seed)
-                np.random.seed(ep_seed % (2 ** 32))
-                _sb3 = getattr(model, 'model', None)
-                if _sb3 is not None and hasattr(_sb3, 'set_random_seed'):
-                    _sb3.set_random_seed(ep_seed)
-                print(f'[种子] 第 {ep} 局 seed={ep_seed}')
-            try:
-                obs, _ = env.reset()
-            except (TimeoutError, RuntimeError) as e:
-                print(f'[错误] 游戏环境不可用：{e}')
-                print('       检查 launch_browser.py 的页面是否还开着、是否被最小化冻结。')
-                break
-
-            # 用首帧血量作基准，不假设初始满血是多少
-            hp0_d = float(obs[IDX_D_HP]) * OBS_SCALE[IDX_D_HP]
-            hp0_e = float(obs[IDX_E_HP]) * OBS_SCALE[IDX_E_HP]
-
-            steps = att = aligned = 0
-            dist_sum = dz_sum = 0.0
-            info = {}
-            t_ep = time.time()
-
-            while True:
-                action, _ = model.predict(obs, deterministic=not args.stochastic)
-                action = int(action)
-                action_counter[action] += 1
-                att += action in ATTACK_ACTIONS
-
-                obs, reward, terminated, truncated, info = env.step(action)
-                steps += 1
-                dist_sum += abs(float(obs[IDX_DX]) * OBS_SCALE[IDX_DX])
-                dz_sum += dz_px(obs)
-                aligned += depth_aligned(obs)
-
-                if terminated or truncated:
-                    break
-
-            result = info.get('result', 'unknown')
-            hp_d = float(obs[IDX_D_HP]) * OBS_SCALE[IDX_D_HP]
-            hp_e = float(obs[IDX_E_HP]) * OBS_SCALE[IDX_E_HP]
-            rec = {
-                'ep': ep,
-                'seed': ep_seed,
-                'bg': env.observed_bg,
-                'result': result,
-                'steps': steps,
-                'att': att,
-                'att_rate': att / steps if steps else 0.0,
-                'mean_dist': dist_sum / steps if steps else 0.0,
-                'mean_dz': dz_sum / steps if steps else 0.0,
-                'align_rate': aligned / steps if steps else 0.0,
-                'dealt': max(0.0, hp0_e - hp_e),
-                'taken': max(0.0, hp0_d - hp_d),
-                'secs': time.time() - t_ep,
-            }
-            episodes.append(rec)
-
-            left = args.episodes - ep
-            eta = (time.time() - t_start) / ep * left
-            print(f"[{ep:>3}/{args.episodes}] bg={rec['bg']} seed={rec['seed']} "
-                  f"{result:<9} 步数={steps:<5} "
-                  f"出招={att:<4}({rec['att_rate'] * 100:>4.1f}%) "
-                  f"距离={rec['mean_dist']:>5.0f}px "
-                  f"纵深={rec['mean_dz']:>4.0f}px 对齐={rec['align_rate'] * 100:>4.1f}% "
-                  f"打掉={rec['dealt']:>4.0f} 挨打={rec['taken']:>4.0f} "
-                  f"| {rec['secs']:>4.0f}s 剩 {fmt_eta(eta)}")
-    except KeyboardInterrupt:
-        print('\n[中断] 已停止，下面只统计跑完的局。')
-
+    action_counts = Counter()
+    started = time.monotonic()
+    with ExitStack() as resources:
+        url = resources.enter_context(game_server(args.assets))
+        env = SyncLF2Env(url, diff=difficulty, bg=bg, action_repeat=repeat,
+                         max_frames=max_frames, gamma=model.gamma, browser=args.browser,
+                         action_count=int(model.action_space.n), character=character,
+                         opponent_model=opponent_model)
+        resources.callback(env.close)
+        opponent_mode = env.opponent_selector.mode if env.opponent_selector else None
+        opponent_label = f'{env.opponent.title()} PPO ({opponent_mode})' if env.opponent else (
+            f'Dennis {DIFF_NAMES[difficulty]}')
+        print(f'[评估] {character.title()} PPO ({mode}) vs {opponent_label} | '
+              f'{model_path} | bg={bg} | 每步 {repeat} 帧')
+        try:
+            for index in range(args.episodes):
+                seed = args.seed_base + index if args.seed_base >= 0 else DEFAULT_SEED
+                if 'sample' in (mode, opponent_mode) and args.seed_base >= 0:
+                    torch.manual_seed(seed)
+                record, counts = evaluate_episode(env, selector, seed)
+                episodes.append(record)
+                action_counts.update(counts)
+                print(f'[{index + 1}/{args.episodes}] seed={seed} {record["result"]} '
+                      f'{record["frames"]} 帧 | 打掉 {record["dealt"]:.0f} / 挨打 {record["taken"]:.0f} hp',
+                      flush=True)
+        except KeyboardInterrupt:
+            print('[中断] 汇总已完成的对局。')
     if not episodes:
-        print('\n没有完成任何一局，无法统计。')
         return 1
 
-    # ---- 4. 汇总 ----
-    n = len(episodes)
-    wins = sum(e['result'] == 'win' for e in episodes)
-    loses = sum(e['result'] == 'lose' for e in episodes)
-    timeouts = sum(e['result'] == 'max_steps' for e in episodes)
-    frame_to = sum(e['result'] == 'timeout' for e in episodes)
-    other = n - wins - loses - timeouts - frame_to
-
-    total_steps = sum(e['steps'] for e in episodes)
-    total_att = sum(e['att'] for e in episodes)
-    att_rate = total_att / total_steps if total_steps else 0.0
-    mean_steps = total_steps / n
-    mean_dist = sum(e['mean_dist'] for e in episodes) / n
-    mean_dz = sum(e['mean_dz'] for e in episodes) / n
-    align_rate = sum(e['align_rate'] for e in episodes) / n
-    mean_dealt = sum(e['dealt'] for e in episodes) / n
-    mean_taken = sum(e['taken'] for e in episodes) / n
-
-    lo, hi = wilson(wins, n)
-
-    print()
-    print('=' * 68)
-    print(f'评估结果：{model_path}，共 {n} 局，{algo.upper()}，{model.describe()}')
-    print('=' * 68)
-    line = f'胜 {wins} / 负 {loses} / 超时 {timeouts}'
-    if frame_to:
-        line += f' / 帧超时 {frame_to}'
-    if other:
-        line += f' / 其它 {other}'
-    print(line)
-    print(f'胜率        {wins / n * 100:5.1f}%   (95% Wilson CI {lo * 100:.1f}% – {hi * 100:.1f}%)')
-
-    decisive = wins + loses
-    if decisive:
-        print(f'决胜局胜率  {wins / decisive * 100:5.1f}%   ({wins}/{decisive}，'
-              f'不含 {timeouts} 局超时)')
-    else:
-        print('决胜局胜率    n/a   （一局都没打出人命，全部超时）')
-
-    n_distinct = len({e['steps'] for e in episodes})
-    if not args.stochastic and n_distinct <= max(1, n // 5):
-        print(f'           注意：{n} 局里只有 {n_distinct} 种不同局长 —— deterministic 模式下')
-        print('           这些局几乎是同一条轨迹，上面的置信区间偏乐观。加 --stochastic 再看一遍。')
-
-    print()
-    print(f'平均局长    {mean_steps:7.0f} 帧（约 {mean_steps / 45:.0f} 秒/局）')
-    print(f'平均距离    {mean_dist:7.0f} px   （水平 |dx|）')
-    print(f'平均纵深    {mean_dz:7.0f} px   （|dz|，越小越贴同一条深度线）')
-    print(f'纵深对齐率  {align_rate * 100:7.1f}%   <- |dz| <= 12px（zwidth）才可能打中')
-    print(f'出招占比    {att_rate * 100:7.1f}%   '
-          f'<- 随机策略基线 {RANDOM_ATTACK_RATE * 100:.1f}%')
-    if att_rate < RANDOM_ATTACK_RATE * 0.5:
-        print('            ↑ 明显低于随机：模型学到的是「别出招」，不是「怎么打」')
-    print(f'平均打掉    {mean_dealt:7.0f} hp / 平均挨打 {mean_taken:.0f} hp')
-
-    print()
-    print('动作分布（全部 %d 步）：' % total_steps)
-    for a, c in action_counter.most_common():
-        bar = '#' * int(c / max(action_counter.values()) * 40)
-        tag = ' <- 出招' if a in ATTACK_ACTIONS else ''
-        print(f'  {a:>2} {str(ACTION_KEYS[a]):<14} {c:>6}  {c / total_steps * 100:>5.1f}%  {bar}{tag}')
-
-    print()
-    elapsed = time.time() - t_start
-    print(f'总耗时 {fmt_eta(elapsed)}')
-
+    results = Counter(record['result'] for record in episodes)
+    count = len(episodes)
+    wins, losses = results['win'], results['lose']
+    center_wins = sum(record['center_win'] for record in episodes)
+    lower, upper = wilson(wins, count)
+    mean_frames = sum(record['frames'] for record in episodes) / count
+    mean_dist = sum(record['mean_dist'] for record in episodes) / count
+    mean_dz = sum(record['mean_dz'] for record in episodes) / count
+    align_rate = sum(record['align_rate'] for record in episodes) / count
+    attack_rate = sum(record['attacks'] for record in episodes) / action_counts.total()
+    print(f'胜 {wins} / 负 {losses} / 平 {results["draw"]} / 超时 {results["max_steps"]}')
+    print(f'胜率 {wins / count:.1%}（95% Wilson 区间 {lower:.1%}–{upper:.1%}）')
+    print(f'场中胜 {center_wins}/{count} ({center_wins / count:.1%})')
+    print(f'平均 {mean_frames:.0f} 帧 | 水平距离 {mean_dist:.1f}px | 纵深 {mean_dz:.1f}px | '
+          f'纵深对齐 {align_rate:.1%} | 出招 {attack_rate:.1%}')
     if args.json:
+        action_space_size = int(model.action_space.n)
         summary = {
-            'model': model_path, 'algo': algo,
-            'action_selection': model.describe(),
-            'n': n, 'wins': wins, 'loses': loses,
-            'timeouts': timeouts, 'frame_timeouts': frame_to, 'other': other,
-            'win_rate': wins / n, 'win_rate_ci': [lo, hi],
-            'win_rate_decisive': (wins / decisive) if decisive else None,
-            'mean_len': mean_steps, 'mean_dist': mean_dist,
-            'mean_dz': mean_dz, 'align_rate': align_rate,
-            'alignment_zwidth': 12.0,
-            'attack_rate': att_rate, 'random_attack_rate': RANDOM_ATTACK_RATE,
-            'mean_dealt': mean_dealt, 'mean_taken': mean_taken,
-            'distinct_len': n_distinct, 'elapsed_secs': round(elapsed, 1),
-            'action_counts': {action_name(a): c for a, c in action_counter.most_common()},
-            'checkpoint_meta': meta,
-            # 难度自证：写报告时不用再猜这次是在打谁
-            'difficulty_requested': args.diff,
-            'difficulty_index': env.diff,
-            'difficulty_observed': env.observed_difficulty,
-            'ai_observed': env.observed_ai,
-            # 种子协议：写报告时照着这三个字段就能逐局复现
-            'seed_base': seed_base,
-            'seed_scheme': (None if seed_base is None
-                            else '第 i 局（从 0 起）seed = seed_base + i'),
-            'seeds': [e['seed'] for e in episodes],
-            # 场地：各背景宽度差 4 倍，不固定的话换 seed 等于换游戏
-            'bg_requested': args.bg,
-            'bg_observed': env.observed_bg,
-            'bgs': [e['bg'] for e in episodes],
+            'model': model_path, 'algo': 'ppo', 'action_selection': 'argmax' if mode == 'greedy' else mode,
+            'character': character, 'opponent_character': env.opponent or 'dennis',
+            'opponent_model': opponent_path, 'opponent_action_selection': opponent_mode,
+            'n': count, 'wins': wins, 'loses': losses, 'draws': results['draw'],
+            'timeouts': results['max_steps'], 'frame_timeouts': 0, 'other': results['draw'],
+            'win_rate': wins / count, 'win_rate_ci': [lower, upper],
+            'center_wins': center_wins, 'center_win_rate': center_wins / count,
+            'win_rate_decisive': wins / (wins + losses) if wins + losses else None,
+            'mean_len': mean_frames, 'mean_dist': mean_dist, 'mean_dz': mean_dz,
+            'align_rate': align_rate, 'alignment_zwidth': 12.0,
+            'attack_rate': attack_rate,
+            'random_attack_rate': sum(is_attack(action, character) for action in range(action_space_size))
+                                  / action_space_size,
+            'mean_dealt': sum(record['dealt'] for record in episodes) / count,
+            'mean_taken': sum(record['taken'] for record in episodes) / count,
+            'action_counts': {action_name(action, character): count for action, count in action_counts.most_common()},
+            'checkpoint_meta': {'algo': 'ppo', 'num_timesteps': model.num_timesteps},
+            'difficulty_requested': args.diff, 'difficulty_index': difficulty,
+            'difficulty_observed': env.observed_difficulty, 'ai_observed': env.observed_ai,
+            'bg_requested': args.bg, 'bg_observed': env.observed_bg,
+            'bgs': [record['bg'] for record in episodes],
+            'action_repeat': repeat, 'max_frames': max_frames,
+            'seed_base': None if args.seed_base < 0 else args.seed_base,
+            'seeds': [record['seed'] for record in episodes],
+            'elapsed_secs': round(time.monotonic() - started, 1), 'episodes': episodes,
         }
-        try:
-            with open(args.json, 'w', encoding='utf-8') as f:
-                json.dump(summary, f, ensure_ascii=False, indent=1)
-            print(f'汇总已写入 {args.json}')
-        except OSError as e:
-            print(f'[警告] 写 {args.json} 失败：{e}')
-
+        args.json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
     return 0
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    raise SystemExit(main())

@@ -1,0 +1,546 @@
+[PPO] 12 进程 | 512 环境 × 64 步/轮 | 动作重复 4 帧 | greedy | 目标 Difficult
+Logging to runs/ppo-combat/logs/PPO_0
+[课程] 0 步 | 阶段 1/1 Difficult | start | 新开对局生效
+[评估] 0 步 | Difficult | 胜 25/64 (39.1%) | 场中胜 25/64 (39.1%)
+-------------------------------------------
+| curriculum/                  |          |
+|    difficulty                | 2        |
+|    stage                     | 1        |
+| eval/                        |          |
+|    difficult_center_win_rate | 0.391    |
+|    difficult_win_rate        | 0.391    |
+| time/                        |          |
+|    fps                       | 2549     |
+|    iterations                | 1        |
+|    time_elapsed              | 12       |
+|    total_timesteps           | 32768    |
+-------------------------------------------
+------------------------------------------
+| curriculum/             |              |
+|    difficulty           | 2            |
+|    stage                | 1            |
+| rollout/                |              |
+|    ep_len_mean          | 121          |
+|    ep_rew_mean          | 0.685        |
+|    success_rate         | 0.667        |
+| time/                   |              |
+|    fps                  | 3854         |
+|    iterations           | 2            |
+|    time_elapsed         | 17           |
+|    total_timesteps      | 65536        |
+| train/                  |              |
+|    approx_kl            | 0.0016246189 |
+|    clip_fraction        | 0.0156       |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -0.187       |
+|    explained_variance   | -0.588       |
+|    learning_rate        | 0.00015      |
+|    loss                 | 0.0279       |
+|    n_updates            | 4            |
+|    policy_gradient_loss | -0.000832    |
+|    value_loss           | 0.0717       |
+------------------------------------------
+[评估] 65536 步 | Difficult | 胜 27/64 (42.2%) | 场中胜 27/64 (42.2%)
+-----------------------------------------------
+| curriculum/                  |              |
+|    difficulty                | 2            |
+|    stage                     | 1            |
+| eval/                        |              |
+|    difficult_center_win_rate | 0.422        |
+|    difficult_win_rate        | 0.422        |
+| rollout/                     |              |
+|    ep_len_mean               | 162          |
+|    ep_rew_mean               | 0.357        |
+|    success_rate              | 0.595        |
+| time/                        |              |
+|    fps                       | 3520         |
+|    iterations                | 3            |
+|    time_elapsed              | 27           |
+|    total_timesteps           | 98304        |
+| train/                       |              |
+|    approx_kl                 | 0.0014050878 |
+|    clip_fraction             | 0.0137       |
+|    clip_range                | 0.2          |
+|    entropy_loss              | -0.159       |
+|    explained_variance        | 0.62         |
+|    learning_rate             | 0.00015      |
+|    loss                      | 0.009        |
+|    n_updates                 | 8            |
+|    policy_gradient_loss      | -0.000747    |
+|    value_loss                | 0.0217       |
+-----------------------------------------------
+-------------------------------------------
+| curriculum/             |               |
+|    difficulty           | 2             |
+|    stage                | 1             |
+| rollout/                |               |
+|    ep_len_mean          | 221           |
+|    ep_rew_mean          | 0.697         |
+|    success_rate         | 0.74          |
+| time/                   |               |
+|    fps                  | 4111          |
+|    iterations           | 4             |
+|    time_elapsed         | 31            |
+|    total_timesteps      | 131072        |
+| train/                  |               |
+|    approx_kl            | 0.00095232157 |
+|    clip_fraction        | 0.00993       |
+|    clip_range           | 0.2           |
+|    entropy_loss         | -0.117        |
+|    explained_variance   | 0.618         |
+|    learning_rate        | 0.00015       |
+|    loss                 | 0.0125        |
+|    n_updates            | 12            |
+|    policy_gradient_loss | -0.000432     |
+|    value_loss           | 0.0312        |
+-------------------------------------------
+[评估] 131072 步 | Difficult | 胜 24/64 (37.5%) | 场中胜 24/64 (37.5%)
+-----------------------------------------------
+| curriculum/                  |              |
+|    difficulty                | 2            |
+|    stage                     | 1            |
+| eval/                        |              |
+|    difficult_center_win_rate | 0.375        |
+|    difficult_win_rate        | 0.375        |
+| rollout/                     |              |
+|    ep_len_mean               | 282          |
+|    ep_rew_mean               | 0.108        |
+|    success_rate              | 0.51         |
+| time/                        |              |
+|    fps                       | 3845         |
+|    iterations                | 5            |
+|    time_elapsed              | 42           |
+|    total_timesteps           | 163840       |
+| train/                       |              |
+|    approx_kl                 | 0.0013387986 |
+|    clip_fraction             | 0.014        |
+|    clip_range                | 0.2          |
+|    entropy_loss              | -0.1         |
+|    explained_variance        | 0.567        |
+|    learning_rate             | 0.00015      |
+|    loss                      | 0.0188       |
+|    n_updates                 | 16           |
+|    policy_gradient_loss      | -0.000166    |
+|    value_loss                | 0.0458       |
+-----------------------------------------------
+------------------------------------------
+| curriculum/             |              |
+|    difficulty           | 2            |
+|    stage                | 1            |
+| rollout/                |              |
+|    ep_len_mean          | 302          |
+|    ep_rew_mean          | -0.0576      |
+|    success_rate         | 0.43         |
+| time/                   |              |
+|    fps                  | 4223         |
+|    iterations           | 6            |
+|    time_elapsed         | 46           |
+|    total_timesteps      | 196608       |
+| train/                  |              |
+|    approx_kl            | 0.0011299322 |
+|    clip_fraction        | 0.0146       |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -0.101       |
+|    explained_variance   | 0.466        |
+|    learning_rate        | 0.00015      |
+|    loss                 | 0.0223       |
+|    n_updates            | 20           |
+|    policy_gradient_loss | -0.000189    |
+|    value_loss           | 0.0516       |
+------------------------------------------
+[评估] 196608 步 | Difficult | 胜 32/64 (50.0%) | 场中胜 32/64 (50.0%)
+-----------------------------------------------
+| curriculum/                  |              |
+|    difficulty                | 2            |
+|    stage                     | 1            |
+| eval/                        |              |
+|    difficult_center_win_rate | 0.5          |
+|    difficult_win_rate        | 0.5          |
+| rollout/                     |              |
+|    ep_len_mean               | 313          |
+|    ep_rew_mean               | -0.0852      |
+|    success_rate              | 0.41         |
+| time/                        |              |
+|    fps                       | 4034         |
+|    iterations                | 7            |
+|    time_elapsed              | 56           |
+|    total_timesteps           | 229376       |
+| train/                       |              |
+|    approx_kl                 | 0.0012418785 |
+|    clip_fraction             | 0.0146       |
+|    clip_range                | 0.2          |
+|    entropy_loss              | -0.105       |
+|    explained_variance        | 0.577        |
+|    learning_rate             | 0.00015      |
+|    loss                      | 0.012        |
+|    n_updates                 | 24           |
+|    policy_gradient_loss      | -0.0004      |
+|    value_loss                | 0.0279       |
+-----------------------------------------------
+------------------------------------------
+| curriculum/             |              |
+|    difficulty           | 2            |
+|    stage                | 1            |
+| rollout/                |              |
+|    ep_len_mean          | 315          |
+|    ep_rew_mean          | 0.376        |
+|    success_rate         | 0.6          |
+| time/                   |              |
+|    fps                  | 4315         |
+|    iterations           | 8            |
+|    time_elapsed         | 60           |
+|    total_timesteps      | 262144       |
+| train/                  |              |
+|    approx_kl            | 0.0006966101 |
+|    clip_fraction        | 0.0117       |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -0.0879      |
+|    explained_variance   | 0.6          |
+|    learning_rate        | 0.00015      |
+|    loss                 | 0.0128       |
+|    n_updates            | 28           |
+|    policy_gradient_loss | 9.78e-05     |
+|    value_loss           | 0.024        |
+------------------------------------------
+[评估] 262144 步 | Difficult | 胜 31/64 (48.4%) | 场中胜 31/64 (48.4%)
+-----------------------------------------------
+| curriculum/                  |              |
+|    difficulty                | 2            |
+|    stage                     | 1            |
+| eval/                        |              |
+|    difficult_center_win_rate | 0.484        |
+|    difficult_win_rate        | 0.484        |
+| rollout/                     |              |
+|    ep_len_mean               | 304          |
+|    ep_rew_mean               | 0.403        |
+|    success_rate              | 0.62         |
+| time/                        |              |
+|    fps                       | 4123         |
+|    iterations                | 9            |
+|    time_elapsed              | 71           |
+|    total_timesteps           | 294912       |
+| train/                       |              |
+|    approx_kl                 | 0.0014299256 |
+|    clip_fraction             | 0.0174       |
+|    clip_range                | 0.2          |
+|    entropy_loss              | -0.0873      |
+|    explained_variance        | 0.572        |
+|    learning_rate             | 0.00015      |
+|    loss                      | 0.0119       |
+|    n_updates                 | 32           |
+|    policy_gradient_loss      | -9.94e-05    |
+|    value_loss                | 0.0229       |
+-----------------------------------------------
+-----------------------------------------
+| curriculum/             |             |
+|    difficulty           | 2           |
+|    stage                | 1           |
+| rollout/                |             |
+|    ep_len_mean          | 552         |
+|    ep_rew_mean          | -0.838      |
+|    success_rate         | 0.1         |
+| time/                   |             |
+|    fps                  | 4339        |
+|    iterations           | 10          |
+|    time_elapsed         | 75          |
+|    total_timesteps      | 327680      |
+| train/                  |             |
+|    approx_kl            | 0.001795501 |
+|    clip_fraction        | 0.0177      |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -0.0866     |
+|    explained_variance   | 0.56        |
+|    learning_rate        | 0.00015     |
+|    loss                 | 0.0113      |
+|    n_updates            | 36          |
+|    policy_gradient_loss | -7.65e-05   |
+|    value_loss           | 0.0216      |
+-----------------------------------------
+[评估] 327680 步 | Difficult | 胜 26/64 (40.6%) | 场中胜 26/64 (40.6%)
+-----------------------------------------------
+| curriculum/                  |              |
+|    difficulty                | 2            |
+|    stage                     | 1            |
+| eval/                        |              |
+|    difficult_center_win_rate | 0.406        |
+|    difficult_win_rate        | 0.406        |
+| rollout/                     |              |
+|    ep_len_mean               | 478          |
+|    ep_rew_mean               | -0.603       |
+|    success_rate              | 0.2          |
+| time/                        |              |
+|    fps                       | 4142         |
+|    iterations                | 11           |
+|    time_elapsed              | 87           |
+|    total_timesteps           | 360448       |
+| train/                       |              |
+|    approx_kl                 | 0.0009319699 |
+|    clip_fraction             | 0.0126       |
+|    clip_range                | 0.2          |
+|    entropy_loss              | -0.117       |
+|    explained_variance        | 0.214        |
+|    learning_rate             | 0.00015      |
+|    loss                      | 0.0664       |
+|    n_updates                 | 40           |
+|    policy_gradient_loss      | 0.000492     |
+|    value_loss                | 0.148        |
+-----------------------------------------------
+------------------------------------------
+| curriculum/             |              |
+|    difficulty           | 2            |
+|    stage                | 1            |
+| rollout/                |              |
+|    ep_len_mean          | 375          |
+|    ep_rew_mean          | -0.167       |
+|    success_rate         | 0.38         |
+| time/                   |              |
+|    fps                  | 4318         |
+|    iterations           | 12           |
+|    time_elapsed         | 91           |
+|    total_timesteps      | 393216       |
+| train/                  |              |
+|    approx_kl            | 0.0010962378 |
+|    clip_fraction        | 0.01         |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -0.129       |
+|    explained_variance   | 0.644        |
+|    learning_rate        | 0.00015      |
+|    loss                 | 0.0124       |
+|    n_updates            | 44           |
+|    policy_gradient_loss | -0.000576    |
+|    value_loss           | 0.0262       |
+------------------------------------------
+[评估] 393216 步 | Difficult | 胜 28/64 (43.8%) | 场中胜 28/64 (43.8%)
+-----------------------------------------------
+| curriculum/                  |              |
+|    difficulty                | 2            |
+|    stage                     | 1            |
+| eval/                        |              |
+|    difficult_center_win_rate | 0.438        |
+|    difficult_win_rate        | 0.438        |
+| rollout/                     |              |
+|    ep_len_mean               | 385          |
+|    ep_rew_mean               | -0.0195      |
+|    success_rate              | 0.43         |
+| time/                        |              |
+|    fps                       | 4186         |
+|    iterations                | 13           |
+|    time_elapsed              | 101          |
+|    total_timesteps           | 425984       |
+| train/                       |              |
+|    approx_kl                 | 0.0013383611 |
+|    clip_fraction             | 0.0131       |
+|    clip_range                | 0.2          |
+|    entropy_loss              | -0.107       |
+|    explained_variance        | 0.702        |
+|    learning_rate             | 0.00015      |
+|    loss                      | 0.013        |
+|    n_updates                 | 48           |
+|    policy_gradient_loss      | -0.000819    |
+|    value_loss                | 0.0286       |
+-----------------------------------------------
+------------------------------------------
+| curriculum/             |              |
+|    difficulty           | 2            |
+|    stage                | 1            |
+| rollout/                |              |
+|    ep_len_mean          | 415          |
+|    ep_rew_mean          | -0.196       |
+|    success_rate         | 0.37         |
+| time/                   |              |
+|    fps                  | 4334         |
+|    iterations           | 14           |
+|    time_elapsed         | 105          |
+|    total_timesteps      | 458752       |
+| train/                  |              |
+|    approx_kl            | 0.0012121696 |
+|    clip_fraction        | 0.0124       |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -0.0995      |
+|    explained_variance   | 0.621        |
+|    learning_rate        | 0.00015      |
+|    loss                 | 0.025        |
+|    n_updates            | 52           |
+|    policy_gradient_loss | -0.000219    |
+|    value_loss           | 0.0505       |
+------------------------------------------
+[评估] 458752 步 | Difficult | 胜 27/64 (42.2%) | 场中胜 27/64 (42.2%)
+------------------------------------------------
+| curriculum/                  |               |
+|    difficulty                | 2             |
+|    stage                     | 1             |
+| eval/                        |               |
+|    difficult_center_win_rate | 0.422         |
+|    difficult_win_rate        | 0.422         |
+| rollout/                     |               |
+|    ep_len_mean               | 435           |
+|    ep_rew_mean               | -0.449        |
+|    success_rate              | 0.26          |
+| time/                        |               |
+|    fps                       | 4230          |
+|    iterations                | 15            |
+|    time_elapsed              | 116           |
+|    total_timesteps           | 491520        |
+| train/                       |               |
+|    approx_kl                 | 0.00091610395 |
+|    clip_fraction             | 0.0103        |
+|    clip_range                | 0.2           |
+|    entropy_loss              | -0.12         |
+|    explained_variance        | 0.527         |
+|    learning_rate             | 0.00015       |
+|    loss                      | 0.0338        |
+|    n_updates                 | 56            |
+|    policy_gradient_loss      | -0.00018      |
+|    value_loss                | 0.0671        |
+------------------------------------------------
+-------------------------------------------
+| curriculum/             |               |
+|    difficulty           | 2             |
+|    stage                | 1             |
+| rollout/                |               |
+|    ep_len_mean          | 381           |
+|    ep_rew_mean          | -0.154        |
+|    success_rate         | 0.37          |
+| time/                   |               |
+|    fps                  | 4360          |
+|    iterations           | 16            |
+|    time_elapsed         | 120           |
+|    total_timesteps      | 524288        |
+| train/                  |               |
+|    approx_kl            | 0.00082995946 |
+|    clip_fraction        | 0.0105        |
+|    clip_range           | 0.2           |
+|    entropy_loss         | -0.12         |
+|    explained_variance   | 0.636         |
+|    learning_rate        | 0.00015       |
+|    loss                 | 0.0225        |
+|    n_updates            | 60            |
+|    policy_gradient_loss | -0.000452     |
+|    value_loss           | 0.0379        |
+-------------------------------------------
+[评估] 524288 步 | Difficult | 胜 28/64 (43.8%) | 场中胜 28/64 (43.8%)
+-----------------------------------------------
+| curriculum/                  |              |
+|    difficulty                | 2            |
+|    stage                     | 1            |
+| eval/                        |              |
+|    difficult_center_win_rate | 0.438        |
+|    difficult_win_rate        | 0.438        |
+| rollout/                     |              |
+|    ep_len_mean               | 336          |
+|    ep_rew_mean               | 0.0712       |
+|    success_rate              | 0.47         |
+| time/                        |              |
+|    fps                       | 4271         |
+|    iterations                | 17           |
+|    time_elapsed              | 130          |
+|    total_timesteps           | 557056       |
+| train/                       |              |
+|    approx_kl                 | 0.0012879099 |
+|    clip_fraction             | 0.0148       |
+|    clip_range                | 0.2          |
+|    entropy_loss              | -0.112       |
+|    explained_variance        | 0.72         |
+|    learning_rate             | 0.00015      |
+|    loss                      | 0.017        |
+|    n_updates                 | 64           |
+|    policy_gradient_loss      | -0.00052     |
+|    value_loss                | 0.0299       |
+-----------------------------------------------
+-----------------------------------------
+| curriculum/             |             |
+|    difficulty           | 2           |
+|    stage                | 1           |
+| rollout/                |             |
+|    ep_len_mean          | 360         |
+|    ep_rew_mean          | 0.0821      |
+|    success_rate         | 0.48        |
+| time/                   |             |
+|    fps                  | 4388        |
+|    iterations           | 18          |
+|    time_elapsed         | 134         |
+|    total_timesteps      | 589824      |
+| train/                  |             |
+|    approx_kl            | 0.000937156 |
+|    clip_fraction        | 0.0144      |
+|    clip_range           | 0.2         |
+|    entropy_loss         | -0.102      |
+|    explained_variance   | 0.682       |
+|    learning_rate        | 0.00015     |
+|    loss                 | 0.0142      |
+|    n_updates            | 68          |
+|    policy_gradient_loss | -0.000372   |
+|    value_loss           | 0.0363      |
+-----------------------------------------
+[评估] 589824 步 | Difficult | 胜 27/64 (42.2%) | 场中胜 27/64 (42.2%)
+----------------------------------------------
+| curriculum/                  |             |
+|    difficulty                | 2           |
+|    stage                     | 1           |
+| eval/                        |             |
+|    difficult_center_win_rate | 0.422       |
+|    difficult_win_rate        | 0.422       |
+| rollout/                     |             |
+|    ep_len_mean               | 547         |
+|    ep_rew_mean               | -0.893      |
+|    success_rate              | 0.08        |
+| time/                        |             |
+|    fps                       | 4299        |
+|    iterations                | 19          |
+|    time_elapsed              | 144         |
+|    total_timesteps           | 622592      |
+| train/                       |             |
+|    approx_kl                 | 0.001544945 |
+|    clip_fraction             | 0.015       |
+|    clip_range                | 0.2         |
+|    entropy_loss              | -0.101      |
+|    explained_variance        | 0.644       |
+|    learning_rate             | 0.00015     |
+|    loss                      | 0.0214      |
+|    n_updates                 | 72          |
+|    policy_gradient_loss      | -0.000487   |
+|    value_loss                | 0.0412      |
+----------------------------------------------
+------------------------------------------
+| curriculum/             |              |
+|    difficulty           | 2            |
+|    stage                | 1            |
+| rollout/                |              |
+|    ep_len_mean          | 422          |
+|    ep_rew_mean          | -0.225       |
+|    success_rate         | 0.36         |
+| time/                   |              |
+|    fps                  | 4408         |
+|    iterations           | 20           |
+|    time_elapsed         | 148          |
+|    total_timesteps      | 655360       |
+| train/                  |              |
+|    approx_kl            | 0.0011072824 |
+|    clip_fraction        | 0.0132       |
+|    clip_range           | 0.2          |
+|    entropy_loss         | -0.107       |
+|    explained_variance   | 0.569        |
+|    learning_rate        | 0.00015      |
+|    loss                 | 0.031        |
+|    n_updates            | 76           |
+|    policy_gradient_loss | -0.000316    |
+|    value_loss           | 0.0692       |
+------------------------------------------
+[评估] 655360 步 | Difficult | 胜 28/64 (43.8%) | 场中胜 28/64 (43.8%)
+-----------------------------------------------
+| eval/                        |              |
+|    difficult_center_win_rate | 0.438        |
+|    difficult_win_rate        | 0.438        |
+| train/                       |              |
+|    approx_kl                 | 0.0013301705 |
+|    clip_fraction             | 0.0168       |
+|    clip_range                | 0.2          |
+|    entropy_loss              | -0.119       |
+|    explained_variance        | 0.682        |
+|    learning_rate             | 0.00015      |
+|    loss                      | 0.0198       |
+|    n_updates                 | 80           |
+|    policy_gradient_loss      | 2.92e-05     |
+|    value_loss                | 0.038        |
+-----------------------------------------------
+[完成] 模型已保存到 runs/ppo-combat/lf2_ppo.zip

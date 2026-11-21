@@ -1,0 +1,33 @@
+shard=7 center_wins=18 rows=15374
+shard=1 center_wins=17 rows=17683
+shard=6 center_wins=22 rows=18272
+shard=11 center_wins=23 rows=16693
+shard=4 center_wins=19 rows=18385
+shard=3 center_wins=15 rows=15875
+shard=2 center_wins=22 rows=17776
+shard=0 center_wins=19 rows=15345
+shard=5 center_wins=19 rows=19744
+shard=8 center_wins=21 rows=18676
+shard=9 center_wins=23 rows=16550
+shard=10 center_wins=24 rows=19091
+shard=17 center_wins=26 rows=16784
+shard=14 center_wins=27 rows=15758
+shard=12 center_wins=23 rows=18247
+shard=15 center_wins=20 rows=18149
+shard=19 center_wins=21 rows=17918
+shard=18 center_wins=18 rows=17728
+shard=13 center_wins=22 rows=19878
+shard=16 center_wins=23 rows=19954
+Using cpu device
+epoch=1 demonstration_loss=1.049
+epoch=2 demonstration_loss=0.354
+epoch=3 demonstration_loss=0.227
+epoch=4 demonstration_loss=0.184
+epoch=5 demonstration_loss=0.160
+epoch=6 demonstration_loss=0.144
+epoch=7 demonstration_loss=0.133
+epoch=8 demonstration_loss=0.124
+epoch=9 demonstration_loss=0.116
+epoch=10 demonstration_loss=0.111
+epoch=11 demonstration_loss=0.105
+epoch=12 demonstration_loss=0.101
